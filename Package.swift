@@ -9,7 +9,7 @@ let package = Package(
         .executableTarget(
             name: "LiveBilingualCaptions",
             dependencies: ["CaptionsCore"],
-            swiftSettings: [.swiftLanguageMode(.v5)] // Task 7에서 .v6으로 전환
+            swiftSettings: [.swiftLanguageMode(.v6)]
         ),
         .testTarget(
             name: "CaptionsCoreTests",
