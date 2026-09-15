@@ -1,0 +1,15 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+  <key>CFBundleExecutable</key><string>LiveBilingualCaptions</string>
+  <key>CFBundleIdentifier</key><string>local.codex.LiveBilingualCaptions</string>
+  <key>CFBundleName</key><string>Live Bilingual Captions</string>
+  <key>CFBundleDisplayName</key><string>Live Bilingual Captions</string>
+  <key>CFBundlePackageType</key><string>APPL</string>
+  <key>CFBundleShortVersionString</key><string>1.0</string>
+  <key>CFBundleVersion</key><string>1</string>
+  <key>LSMinimumSystemVersion</key><string>14.0</string>
+  <key>NSMicrophoneUsageDescription</key><string>영어와 한국어 음성을 실시간 자막으로 표시하기 위해 마이크를 사용합니다.</string>
+  <key>NSSpeechRecognitionUsageDescription</key><string>말한 내용을 실시간 자막으로 표시하기 위해 음성 인식을 사용합니다.</string>
+  <key>LSUIElement</key><true/>
+</dict></plist>
