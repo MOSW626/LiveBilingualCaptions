@@ -1056,7 +1056,8 @@ Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>"
 
 **Files:**
 - Create: `Sources/CaptionsCore/Translator.swift`, `Tests/CaptionsCoreTests/TranslatorTests.swift`
-- Modify: `Sources/LiveBilingualCaptions/main.swift` — `translate(_:)` 463–489줄 제거, `Translator` 배선
+- Modify: `Sources/LiveBilingualCaptions/main.swift` — Google 번역 경로 제거, `Translator` 배선
+  (Task 5가 이 파일을 이미 재작성했으므로 기준 커밋 줄번호로 찾지 말고 심볼명으로 찾는다)
 
 **Interfaces:**
 - Consumes: `CaptionLanguage`, `LanguageTable` (Task 2), `Transcript`와 발화 ID (Task 5)
@@ -1323,9 +1324,11 @@ Expected: 기존 테스트와 Step 5a의 응답 순서 회귀 테스트 전부 P
 
 - [ ] **Step 5: `main.swift` 에서 Google 번역 제거**
 
-기준 커밋 463–489줄 `translate(_:)` 전체와 `scheduleTranslation`, `translateWork`,
-`pendingTranslationText`, `lastTranslationStartedAt`, `lastTranslatedSource` 를 삭제하고
-`Translator` 로 대체한다.
+다음 심볼을 전부 삭제하고 `Translator` 로 대체한다: `translate(_:)`, `scheduleTranslation`,
+`translateWork`, `pendingTranslationText`, `lastTranslationStartedAt`, `lastTranslatedSource`.
+Task 5가 이 파일을 이미 재작성했으므로 **기준 커밋의 줄번호로 찾지 않는다.** 심볼명으로 찾는다.
+삭제 후 `grep -n 'translateWork\|pendingTranslationText\|lastTranslationStartedAt' Sources/` 가
+비어 있어야 한다.
 
 ```swift
 private let translator = Translator(table: .default)
@@ -1795,12 +1798,8 @@ struct SettingsView: View {
                     Text("유지 시간 \(Int(settings.captionHoldSeconds))초")
                 }
             }
-            Section("번역 보정") {
-                Toggle("Claude 로 확정 문장 다듬기", isOn: $settings.refinementEnabled)
-                Text("켜면 확정된 문장만 인터넷으로 전송됩니다. 끄면 모든 처리가 기기 안에서 끝납니다.")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-            }
+            // "번역 보정" 섹션은 Task 10이 추가한다. updateRefiner()가 아직 없으므로
+            // 여기서 토글을 노출하면 동작하지 않는 스위치가 되고 apply()가 컴파일되지 않는다.
         }
         .formStyle(.grouped)
         .frame(width: 420)
@@ -1895,9 +1894,7 @@ private func apply(_ new: Settings) {
     if old.captionHoldSeconds != new.captionHoldSeconds {
         rescheduleCaptionClear()
     }
-    if old.refinementEnabled != new.refinementEnabled {
-        updateRefiner() // Task 10에서 구현. 그전에는 미연결 토글을 표시하지 않는다.
-    }
+    // refinementEnabled 분기는 Task 10이 updateRefiner()와 함께 추가한다.
 }
 ```
 
@@ -2130,6 +2127,24 @@ public struct ClaudeRefiner: TranslationRefiner {
         return text.trimmingCharacters(in: .whitespacesAndNewlines)
     }
 }
+```
+
+- [ ] **Step 3a: Task 9가 미뤄둔 보정 UI와 분기를 추가**
+
+Task 9는 `updateRefiner()` 가 없어 이 둘을 넣지 않았다. 지금 함께 넣는다.
+
+`SettingsView` 에 섹션을 추가한다:
+```swift
+Section("번역 보정") {
+    Toggle("Claude 로 확정 문장 다듬기", isOn: $settings.refinementEnabled)
+    Text("켜면 확정된 문장만 인터넷으로 전송됩니다. 끄면 모든 처리가 기기 안에서 끝납니다.")
+        .font(.caption).foregroundStyle(.secondary)
+}
+```
+
+`AppDelegate.apply(_:)` 에 분기를 추가한다:
+```swift
+if old.refinementEnabled != new.refinementEnabled { updateRefiner() }
 ```
 
 - [ ] **Step 4: 설정 창에 API 키 입력란 추가**
