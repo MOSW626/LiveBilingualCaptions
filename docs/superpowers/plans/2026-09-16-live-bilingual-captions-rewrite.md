@@ -10,6 +10,11 @@
 
 **Spec:** `docs/superpowers/specs/2026-09-16-live-bilingual-captions-design.md`
 
+**검토 수정 (2026-09-16):** Swift 언어 모드, 오디오 변환·수명 관리, 시스템 오디오 시작 경합,
+번역 응답 순서, 자동 언어 전환의 한계, 설정 적용·키 갱신·스펙 누락을 반영했다.
+문서의 코드 예시는 구현 출발점이다. API 존재 확인과 앱 통합 검증을 구분하며,
+아래 체크박스를 실행하기 전에는 빌드·런타임 검증이 완료됐다고 보고하지 않는다.
+
 ---
 
 ## Global Constraints
@@ -23,13 +28,17 @@
 - **새 서드파티 의존성 추가 금지.** `Package.swift` 의 `dependencies` 는 빈 배열을 유지한다. 필요한 것은 전부 시스템 프레임워크에 있다.
 - **`SpeechTranscriber.TranscriptionOption` 에는 `.punctuation` 이 없다.** 케이스는 `etiquetteReplacements` 하나뿐이다. 구두점은 `preset: .progressiveTranscription` 에서 온다. (`.punctuation` 은 `DictationTranscriber` 의 별개 enum 이다 — 기준 커밋 322–397줄의 죽은 코드를 그대로 옮기면 컴파일이 깨진다.)
 - **API 키를 `UserDefaults`·소스코드·환경변수에 두지 않는다.** Keychain 만 쓴다 (Task 10).
-- **번역·인식은 기본적으로 오프라인 동작해야 한다.** 네트워크는 Task 10 의 옵션 기능에서만 쓴다.
+- **설치된 모델로 번역·인식은 오프라인 동작해야 한다.** 최초 음성/번역 모델 다운로드와 Task 10의 옵션 보정은 네트워크를 사용한다.
+- **자동 인식 언어는 실험 기능이다.** 기본값은 한국어 고정. 문자열의 문자 범위 분류를 음성 언어 감지로 간주하지 않는다.
+- **제어 흐름은 한 곳에서 관리한다.** 시작·정지·소스/언어/민감도 변경은 직렬화하고, 취소와 실행 세대 검사를 함께 쓴다.
+- **원문 갱신과 번역 무효화는 동기적으로 함께 수행한다.** 이전 번역·보정 응답은 새 자막에 표시하지 않는다.
 - **모든 사용자 노출 문자열은 한국어.** 기준 커밋의 문구 톤을 따른다.
 - **각 태스크 종료 시 앱이 빌드되고 실행돼야 한다.** 중간에 멈춰도 쓸 수 있는 상태를 남긴다.
 
 ### 검증된 API 시그니처 (2026-09-16, 실제 typecheck 통과)
 
-아래는 추측이 아니라 `swiftc -typecheck` 로 함께 컴파일해 확인한 형태다. 그대로 쓴다.
+아래는 최초 작성 시 확인한 API 호출 형태다. 전체 예제의 Swift 6 동시성 안전성이나
+실제 장치 동작을 보증하지 않는다. 각 태스크에서 해당 타깃의 언어 모드로 다시 빌드한다.
 
 ```swift
 let detector = SpeechDetector(detectionOptions: .init(sensitivityLevel: .medium), reportResults: true)
@@ -73,15 +82,16 @@ let stream = SCStream(filter: filter, configuration: cfg, delegate: nil)
 | `Sources/CaptionsCore/LanguageTable.swift` | 언어 테이블 + 감지 규칙 |
 | `Sources/CaptionsCore/CaptionText.swift` | 자막 문자열 가공 (꼬리 자르기) |
 | `Sources/CaptionsCore/Settings.swift` | 설정 모델 + UserDefaults 영속 |
-| `Sources/CaptionsCore/Debouncer.swift` | 번역 호출 디바운스 |
 | `Sources/CaptionsCore/Transcript.swift` | 부분/확정 전사 타입 |
 | `Sources/CaptionsCore/AudioSource.swift` | `AudioSource` 프로토콜 + `MicSource` |
 | `Sources/CaptionsCore/SystemAudioSource.swift` | ScreenCaptureKit 시스템 오디오 |
 | `Sources/CaptionsCore/SpeechPipeline.swift` | SpeechAnalyzer 구동, 언어 교체 |
+| `Sources/CaptionsCore/AudioBufferConverter.swift` | 분석기 지원 포맷으로 PCM 변환 |
+| `Sources/CaptionsCore/PipelineController.swift` | 실행 세대·시작/정지/재구성 직렬화 |
 | `Sources/CaptionsCore/Translator.swift` | 온디바이스 번역 + `TranslationRefiner` 훅 |
 | `Sources/CaptionsCore/ClaudeRefiner.swift` | LLM 보정 구현 (옵션) |
 | `Sources/CaptionsCore/KeychainStore.swift` | API 키 보관 |
-| `Sources/LiveBilingualCaptions/main.swift` | `@main` 진입점 |
+| `Sources/LiveBilingualCaptions/main.swift` | Task 7 이후 최상위 AppKit 진입점 |
 | `Sources/LiveBilingualCaptions/AppDelegate.swift` | NSPanel, 메뉴바 아이템, 파이프라인 배선 |
 | `Sources/LiveBilingualCaptions/CaptionOverlay.swift` | SwiftUI 자막 뷰, `.translationTask` |
 | `Sources/LiveBilingualCaptions/CaptionState.swift` | `@Observable` UI 상태 |
@@ -92,12 +102,14 @@ let stream = SCStream(filter: filter, configuration: cfg, delegate: nil)
 
 # Task 1: SPM 전환 + 테스트 하네스 + 번들 빌드
 
-기존 동작을 **그대로 둔 채** 빌드 체계만 바꾼다. 이 태스크가 끝나면 앱은 기준 커밋과 똑같이 동작해야 한다.
+기존 동작을 유지하면서 빌드 체계를 바꾼다. 기존 실행 타깃은 임시로 Swift 5 언어 모드를
+명시한다. Swift 6 컴파일러 사용과 Swift 6 언어 모드 채택은 별개다. Core는 처음부터 Swift 6,
+실행 타깃은 Task 7에서 동시성 정리 후 Swift 6으로 전환한다.
 
 **Files:**
 - Create: `Package.swift`, `test.sh`, `Tests/CaptionsCoreTests/SmokeTests.swift`, `Sources/CaptionsCore/CaptionsCore.swift`, `CLAUDE.md`
 - Modify: `build.sh` (전체 교체), `Info.plist` (`LSMinimumSystemVersion`)
-- Move: `Sources/LiveBilingualCaptions/main.swift` 유지 (내용 변경 없음)
+- Modify: `Sources/LiveBilingualCaptions/main.swift` (기존 `@main` 구조의 SPM 빌드 확인; 필요 시 진입점 파일 이름 분리)
 
 **Interfaces:**
 - Consumes: 없음
@@ -116,7 +128,8 @@ let package = Package(
         .target(name: "CaptionsCore"),
         .executableTarget(
             name: "LiveBilingualCaptions",
-            dependencies: ["CaptionsCore"]
+            dependencies: ["CaptionsCore"],
+            swiftSettings: [.swiftLanguageMode(.v5)] // Task 7에서 .v6으로 전환
         ),
         .testTarget(
             name: "CaptionsCoreTests",
@@ -127,6 +140,11 @@ let package = Package(
 ```
 
 `dependencies:` 를 Package 레벨에 두지 않는다 — 서드파티 의존성 금지.
+
+현재 `AppDelegate`는 Swift 6 타입 검사에서 UI 프로퍼티의 MainActor 격리 오류가 발생한다.
+임시 `.v5`는 Task 1의 범위를 빌드 이주로 제한하기 위한 결정이다. `swift build -v`로 타깃별
+언어 모드와 기존 `@main` 진입점 처리를 확인한다. 진입점 오류가 나면 `main.swift`를
+`AppMain.swift`로 이름을 바꾸어 `@main`을 유지하고 Task 7의 분리 경로에도 반영한다.
 
 - [ ] **Step 2: `CaptionsCore` 자리표시 파일 생성**
 
@@ -309,7 +327,7 @@ Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>"
 - Consumes: 없음
 - Produces:
   - `public struct CaptionLanguage: Sendable, Equatable, Identifiable` — `id: String`, `locale: Locale`, `displayName: String`, `uniqueRanges: [ClosedRange<UInt32>]`, `sharedRanges: [ClosedRange<UInt32>]`
-  - `public struct LanguageTable: Sendable` — `languages: [CaptionLanguage]`, `static let `default`: LanguageTable`, `func detect(_ text: String, current: CaptionLanguage) -> CaptionLanguage`, `func target(for: CaptionLanguage) -> CaptionLanguage?`, `func language(id: String) -> CaptionLanguage?`
+  - `public struct LanguageTable: Sendable` — `languages: [CaptionLanguage]`, `static let `default`: LanguageTable`, `func detect(_ text: String, current: CaptionLanguage) -> CaptionLanguage`, `func target(for: CaptionLanguage, preferredID: String?) -> CaptionLanguage?`, `func language(id: String) -> CaptionLanguage?`
   - `public static let korean: CaptionLanguage`, `public static let english: CaptionLanguage`
 
 - [ ] **Step 1: 실패하는 테스트 작성**
@@ -398,7 +416,7 @@ public struct CaptionLanguage: Sendable, Equatable, Identifiable {
         sharedRanges: [])
 
     public static let english = CaptionLanguage(
-        locale: Locale(identifier: "en-US"), displayName: "English",
+        locale: Locale(identifier: "en-US"), displayName: "영어",
         uniqueRanges: [],
         sharedRanges: [0x41...0x5A, 0x61...0x7A])
 
@@ -448,9 +466,13 @@ public struct LanguageTable: Sendable {
         return current
     }
 
-    /// 번역 대상 = 감지된 언어가 아닌 첫 번째 언어.
-    public func target(for source: CaptionLanguage) -> CaptionLanguage? {
-        languages.first { $0 != source }
+    /// 3개 이상일 때 설정한 대상을 우선한다. 자기 자신/없는 ID는 첫 다른 언어로 복구한다.
+    public func target(for source: CaptionLanguage, preferredID: String? = nil) -> CaptionLanguage? {
+        if languages.count >= 3, let preferredID,
+           let preferred = language(id: preferredID), preferred != source {
+            return preferred
+        }
+        return languages.first { $0 != source }
     }
 }
 ```
@@ -458,7 +480,10 @@ public struct LanguageTable: Sendable {
 - [ ] **Step 4: 테스트 통과 확인**
 
 Run: `./test.sh`
-Expected: 7개 테스트 전부 PASS
+Expected: 기존 7개와 아래 대상 선택 테스트 전부 PASS.
+
+추가 테스트: `[ko, en, ja]`에서 기본 대상 `ja` 선택, 원문과 대상이 모두 `ja`일 때
+첫 다른 언어 선택, 없는 대상 ID 복구, 2개 언어에서 반대 언어 유지.
 
 - [ ] **Step 5: 커밋**
 
@@ -475,12 +500,16 @@ Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>"
 
 ---
 
-# Task 3: 자막 문자열 가공 · 설정 영속 · 디바운서
+# Task 3: 자막 문자열 가공 · 설정 영속
 
-순수 로직 3종을 한 태스크로 묶는다. 셋 다 작고, 셋 다 이후 태스크가 즉시 쓴다.
+순수 로직 2종을 한 태스크로 묶는다. 둘 다 작고, 둘 다 이후 태스크가 즉시 쓴다.
+
+**Debouncer는 만들지 않는다.** 원안에 있었으나 Task 6이 번역 디바운스를 submit이 소유한
+Task 안에서 처리하기로 확정되면서 쓰는 곳이 없어졌다. 아무도 안 쓰는 actor를 만들고
+테스트까지 붙이는 것은 죽은 코드다. 나중에 디바운스가 여러 곳에서 필요해지면 그때 뽑는다.
 
 **Files:**
-- Create: `Sources/CaptionsCore/CaptionText.swift`, `Sources/CaptionsCore/Settings.swift`, `Sources/CaptionsCore/Debouncer.swift`, `Tests/CaptionsCoreTests/CaptionTextTests.swift`, `Tests/CaptionsCoreTests/SettingsTests.swift`, `Tests/CaptionsCoreTests/DebouncerTests.swift`
+- Create: `Sources/CaptionsCore/CaptionText.swift`, `Sources/CaptionsCore/Settings.swift`, `Tests/CaptionsCoreTests/CaptionTextTests.swift`, `Tests/CaptionsCoreTests/SettingsTests.swift`
 
 **Interfaces:**
 - Consumes: `CaptionLanguage` (Task 2)
@@ -489,8 +518,7 @@ Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>"
   - `public enum AudioSourceKind: String, Codable, Sendable, CaseIterable { case microphone, systemAudio }`
   - `public enum LanguageMode: Equatable, Codable, Sendable { case auto, fixed(String) }`
   - `public enum DetectorSensitivity: String, Codable, Sendable, CaseIterable { case low, medium, high }`
-  - `public struct Settings: Codable, Equatable, Sendable` — `languageMode`, `audioSource`, `fontSize`, `captionHoldSeconds`, `detectorSensitivity`, `refinementEnabled`, `panelOriginX`, `panelOriginY`; `static let `default``, `static func load(from: UserDefaults) -> Settings`, `func save(to: UserDefaults)`
-  - `public actor Debouncer` — `init(interval: Duration)`, `func schedule(_ work: @escaping @Sendable () async -> Void)`, `func cancel()`
+  - `public struct Settings: Codable, Equatable, Sendable` — `languageMode`, `preferredTargetID`, `audioSource`, `fontSize`, `captionHoldSeconds`, `detectorSensitivity`, `refinementEnabled`, `panelOriginX`, `panelOriginY`, `panelWidth`, `panelHeight`; `static let `default``, `static func load(from: UserDefaults) -> Settings`, `func save(to: UserDefaults)`
 
 - [ ] **Step 1: 실패하는 테스트 작성 — 자막 꼬리 자르기**
 
@@ -551,6 +579,9 @@ private func freshDefaults(_ name: String) -> UserDefaults {
     settings.refinementEnabled = true
     settings.panelOriginX = 120
     settings.panelOriginY = 64
+    settings.preferredTargetID = "en-US"
+    settings.panelWidth = 720
+    settings.panelHeight = 240
 
     settings.save(to: defaults)
     #expect(Settings.load(from: defaults) == settings)
@@ -572,56 +603,12 @@ private func freshDefaults(_ name: String) -> UserDefaults {
 }
 ```
 
-- [ ] **Step 3: 실패하는 테스트 작성 — 디바운서**
-
-`Tests/CaptionsCoreTests/DebouncerTests.swift`:
-```swift
-import Testing
-import Foundation
-@testable import CaptionsCore
-
-private actor Counter {
-    var value = 0
-    func bump() { value += 1 }
-}
-
-@Test func 연속_호출은_마지막_한_번만_실행된다() async throws {
-    let counter = Counter()
-    let debouncer = Debouncer(interval: .milliseconds(50))
-    for _ in 0..<5 {
-        await debouncer.schedule { await counter.bump() }
-        try await Task.sleep(for: .milliseconds(5))
-    }
-    try await Task.sleep(for: .milliseconds(200))
-    #expect(await counter.value == 1)
-}
-
-@Test func 간격을_두고_호출하면_각각_실행된다() async throws {
-    let counter = Counter()
-    let debouncer = Debouncer(interval: .milliseconds(30))
-    await debouncer.schedule { await counter.bump() }
-    try await Task.sleep(for: .milliseconds(120))
-    await debouncer.schedule { await counter.bump() }
-    try await Task.sleep(for: .milliseconds(120))
-    #expect(await counter.value == 2)
-}
-
-@Test func 취소하면_실행되지_않는다() async throws {
-    let counter = Counter()
-    let debouncer = Debouncer(interval: .milliseconds(50))
-    await debouncer.schedule { await counter.bump() }
-    await debouncer.cancel()
-    try await Task.sleep(for: .milliseconds(150))
-    #expect(await counter.value == 0)
-}
-```
-
-- [ ] **Step 4: 테스트 실패 확인**
+- [ ] **Step 3: 테스트 실패 확인**
 
 Run: `./test.sh`
-Expected: FAIL — `cannot find 'CaptionText' / 'Settings' / 'Debouncer' in scope`
+Expected: FAIL — `cannot find 'CaptionText' / 'Settings' in scope`
 
-- [ ] **Step 5: `CaptionText` 구현**
+- [ ] **Step 4: `CaptionText` 구현**
 
 `Sources/CaptionsCore/CaptionText.swift`:
 ```swift
@@ -641,7 +628,7 @@ public enum CaptionText {
 }
 ```
 
-- [ ] **Step 6: `Settings` 구현**
+- [ ] **Step 5: `Settings` 구현**
 
 `Sources/CaptionsCore/Settings.swift`:
 ```swift
@@ -677,6 +664,7 @@ public enum DetectorSensitivity: String, Codable, Sendable, CaseIterable {
 
 public struct Settings: Codable, Equatable, Sendable {
     public var languageMode: LanguageMode
+    public var preferredTargetID: String?
     public var audioSource: AudioSourceKind
     public var fontSize: Double
     public var captionHoldSeconds: Double
@@ -684,18 +672,23 @@ public struct Settings: Codable, Equatable, Sendable {
     public var refinementEnabled: Bool
     public var panelOriginX: Double?
     public var panelOriginY: Double?
+    public var panelWidth: Double?
+    public var panelHeight: Double?
 
     public static let storageKey = "settings.v1"
 
     public static let `default` = Settings(
-        languageMode: .auto,
+        languageMode: .fixed("ko-KR"),
+        preferredTargetID: nil,
         audioSource: .microphone,
         fontSize: 20,
         captionHoldSeconds: 10,
         detectorSensitivity: .medium,
         refinementEnabled: false,      // 네트워크·비용이 드는 기능은 기본 꺼짐
         panelOriginX: nil,
-        panelOriginY: nil)
+        panelOriginY: nil,
+        panelWidth: nil,
+        panelHeight: nil)
 
     /// 저장된 값이 없거나 형식이 깨졌으면 기본값으로 돌아간다.
     /// 설정 하나 때문에 앱이 못 뜨는 상황을 만들지 않는다.
@@ -716,50 +709,22 @@ public struct Settings: Codable, Equatable, Sendable {
 `손상된_값이_있으면_기본값으로_복구` 테스트는 문자열을 넣는데 `data(forKey:)` 는 `nil` 을
 돌려주므로 기본값으로 떨어진다. 의도한 동작이다.
 
-- [ ] **Step 7: `Debouncer` 구현**
-
-`Sources/CaptionsCore/Debouncer.swift`:
-```swift
-import Foundation
-
-/// 마지막 호출만 살린다. 부분 전사가 초당 여러 번 쏟아질 때 번역 호출을 줄이는 용도.
-public actor Debouncer {
-    private let interval: Duration
-    private var pending: Task<Void, Never>?
-
-    public init(interval: Duration) { self.interval = interval }
-
-    public func schedule(_ work: @escaping @Sendable () async -> Void) {
-        pending?.cancel()
-        pending = Task { [interval] in
-            try? await Task.sleep(for: interval)
-            guard !Task.isCancelled else { return }
-            await work()
-        }
-    }
-
-    public func cancel() {
-        pending?.cancel()
-        pending = nil
-    }
-}
-```
-
-- [ ] **Step 8: 테스트 통과 확인**
+- [ ] **Step 6: 테스트 통과 확인**
 
 Run: `./test.sh`
-Expected: 총 20개 PASS (Task 1 스모크 1 + Task 2 언어 7 + 이번 12)
-(디바운서 테스트는 실제 시간을 쓰므로 느리다. 간헐적으로 실패하면 간격을 2배로 키운다.)
+Expected: 기존 테스트 및 추가 회귀 테스트 전부 PASS. 총수는 실제 테스트 출력으로 기록한다.
+Settings 라운드트립에 `preferredTargetID`, `panelWidth`, `panelHeight`를 추가하고,
+새 optional 필드가 없는 기존 JSON도 기존 설정값을 보존하며 읽히는지 검증한다.
 
-- [ ] **Step 9: 커밋**
+- [ ] **Step 7: 커밋**
 
 ```bash
 git add Sources/CaptionsCore Tests/CaptionsCoreTests
-git commit -m "feat: add caption text, settings persistence, and debouncer
+git commit -m "feat: add caption text and settings persistence
 
 Settings fall back to defaults on corrupt data so one bad value cannot
-stop the app from launching. Debouncer keeps only the last call, which
-is what partial transcripts need.
+stop the app from launching, and unknown-but-absent optional fields
+decode without wiping the values that are there.
 
 Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>"
 ```
@@ -776,14 +741,15 @@ Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>"
 **Interfaces:**
 - Consumes: 없음
 - Produces:
-  - `public protocol AudioSource: AnyObject` — `func start(_ sink: @escaping @Sendable (AVAudioPCMBuffer) -> Void) async throws -> AVAudioFormat`, `func stop()`
+  - `@MainActor public protocol AudioSource: AnyObject` — `func start(_ sink: @escaping @Sendable (AVAudioPCMBuffer) -> Void) async throws -> AVAudioFormat`, `func stop() async`
   - `public final class MicSource: AudioSource`
   - `public enum AudioSourceError: LocalizedError` — `case noInput, permissionDenied, noDisplay`
 
 - [ ] **Step 1: 프로토콜과 마이크 구현 작성**
 
-`start` 가 포맷을 **반환**한다. `SpeechAnalyzer.prepareToAnalyze(in:)` 가 포맷을 먼저 요구하는데,
-`SCStream` 은 스트림을 켜기 전에는 포맷을 모르기 때문이다.
+`start`는 캡처의 실제 포맷을 반환한다. 이것은 분석기가 지원하는 포맷과 다를 수 있다.
+Task 5에서 지원 포맷을 조회하고 변환한다. 시스템 오디오는 설정 포맷을 알 수 있으나
+실제 첫 버퍼의 포맷을 확인한다. 따라서 첫 버퍼 선도착·무음·취소도 시작 계약에 포함한다.
 
 `Sources/CaptionsCore/AudioSource.swift`:
 ```swift
@@ -804,14 +770,16 @@ public enum AudioSourceError: LocalizedError {
 }
 
 /// 오디오 한 줄기. 구현은 마이크와 시스템 오디오 두 가지다.
+@MainActor
 public protocol AudioSource: AnyObject {
     /// 캡처를 시작하고 실제 오디오 포맷을 돌려준다.
-    /// 포맷을 반환값으로 주는 이유: SCStream 은 켜기 전에 포맷을 알 수 없다.
+    /// sink는 콜백이 반환되기 전에 버퍼를 복사/변환한다. 빌린 버퍼를 비동기로 보관하지 않는다.
     func start(_ sink: @escaping @Sendable (AVAudioPCMBuffer) -> Void) async throws -> AVAudioFormat
-    func stop()
+    func stop() async
 }
 
 /// AVAudioEngine 마이크 입력. 마이크 권한만 필요하고 화면 기록 권한은 필요 없다.
+@MainActor
 public final class MicSource: AudioSource {
     private let engine = AVAudioEngine()
     private var started = false
@@ -828,12 +796,17 @@ public final class MicSource: AudioSource {
             sink(buffer)
         }
         engine.prepare()
-        try engine.start()
+        do { try engine.start() }
+        catch {
+            input.removeTap(onBus: 0)
+            engine.stop()
+            throw error
+        }
         started = true
         return format
     }
 
-    public func stop() {
+    public func stop() async {
         guard started else { return }
         engine.inputNode.removeTap(onBus: 0)
         if engine.isRunning { engine.stop() }
@@ -853,8 +826,8 @@ Expected: 성공. 경고 없음.
 git add Sources/CaptionsCore/AudioSource.swift
 git commit -m "feat: add AudioSource protocol with microphone implementation
 
-start() returns the format because SCStream cannot report one until the
-stream is running; the speech analyzer needs a format up front.
+start() reports the capture format; the analyzer's compatible format
+is negotiated separately. stop() waits for capture teardown.
 
 Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>"
 ```
@@ -865,16 +838,31 @@ Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>"
 
 스펙 §6.2. 기준 커밋의 인식 코드 전부를 `SpeechAnalyzer` 로 갈아치운다.
 
+**이 태스크는 두 단계로 나눠 실행한다.** 검토 수정으로 참조 코드가 구현 계약으로 바뀌면서
+범위가 커졌고, 한 번에 맡기면 검증 없이 통과할 위험이 있다. 이음매는 명확하다 —
+`AudioBufferConverter`는 Speech 프레임워크에 의존하지 않고 합성 PCM으로 완전히 테스트된다.
+
+- **5A**: `Transcript` + `AudioBufferConverter`. 순수 로직, 완전 TDD. Speech 불필요.
+- **5B**: `SpeechPipeline` + `PipelineController` + `main.swift` 재배선. 5A가 통과한 뒤에만 시작한다.
+
+5A가 끝나면 앱은 여전히 기준 커밋처럼 동작한다(아직 배선 전). 5B가 끝나야 엔진이 바뀐다.
+
+`bestAvailableAudioFormat`에는 `considering naturalFormat:` 오버로드가 있다
+(SDK 확인 완료). 캡처 포맷을 넘기면 협상 결과가 입력에 가까워져 변환 폭이 줄어든다.
+`bestAvailableAudioFormat(compatibleWith: modules, considering: captureFormat)`을 먼저 시도하고,
+nil이면 `considering:` 없는 오버로드로 한 번 더 시도한 뒤 그래도 nil이면 시작 실패를 보고한다.
+
 **Files:**
-- Create: `Sources/CaptionsCore/Transcript.swift`, `Sources/CaptionsCore/SpeechPipeline.swift`, `Tests/CaptionsCoreTests/TranscriptTests.swift`
+- Create: `Sources/CaptionsCore/Transcript.swift`, `Sources/CaptionsCore/SpeechPipeline.swift`, `Sources/CaptionsCore/AudioBufferConverter.swift`, `Sources/CaptionsCore/PipelineController.swift`, `Tests/CaptionsCoreTests/TranscriptTests.swift`, `Tests/CaptionsCoreTests/PipelineControllerTests.swift`, `Tests/CaptionsCoreTests/AudioBufferConverterTests.swift`
 - Modify: `Sources/LiveBilingualCaptions/main.swift` — `SFSpeechRecognizer` 경로 전부 제거 후 `SpeechPipeline` 배선
 
 **Interfaces:**
 - Consumes: `AudioSource`, `MicSource` (Task 4), `CaptionLanguage`, `LanguageTable` (Task 2), `DetectorSensitivity` (Task 3)
 - Produces:
   - `public enum Transcript: Sendable, Equatable` — `case partial(String)`, `case final(String)`; `var text: String`, `var isFinal: Bool`
-  - `public enum PipelineEvent: Sendable` — `case installing(Double)`, `case listening`, `case transcript(Transcript)`, `case failed(String)`
-  - `@MainActor public final class SpeechPipeline` — `init(table: LanguageTable, sensitivity: DetectorSensitivity)`, `var onEvent: (@MainActor (PipelineEvent) -> Void)?`, `var currentLanguage: CaptionLanguage`, `func start(source: AudioSource, language: CaptionLanguage) async`, `func switchLanguage(to: CaptionLanguage) async`, `func stop() async`
+  - `PipelineEvent` — 설치/청취/전사/오류. 모든 이벤트에 실행 ID, 전사에는 발화 ID·수정 번호·생성 당시 언어 포함
+  - `@MainActor SpeechPipeline` — Run별 자원 소유, 포맷 변환, 시작/전환/종료. AppDelegate가 직접 호출하지 않음
+  - `@MainActor PipelineController` — `requestStart(configuration:)`, `requestStop()`, `requestReconfigure(configuration:)`, 실행 상태·현행 이벤트 콜백. Step 5의 직렬화 계약 필수
 
 - [ ] **Step 1: `Transcript` 테스트 작성**
 
@@ -927,160 +915,67 @@ public enum Transcript: Sendable, Equatable {
 - [ ] **Step 4: 테스트 통과 확인**
 
 Run: `./test.sh`
-Expected: 22개 PASS
+Expected: Transcript 2개 및 이전 태스크의 기존·추가 테스트 전부 PASS.
 
 - [ ] **Step 5: `SpeechPipeline` 구현**
 
-`Sources/CaptionsCore/SpeechPipeline.swift`:
-```swift
-import Foundation
-import Speech
-import AVFoundation
+이전 코드 예시의 원본 버퍼 직접 전달과 await 후 공유 상태 정리는 제거했다.
+아래는 구현 계약이며 완성 코드가 아니다. 이 순서와 회귀 테스트를 충족하는 구현을
+`SpeechPipeline.swift`, `AudioBufferConverter.swift`, `PipelineController.swift`에 작성한다.
 
-public enum PipelineEvent: Sendable {
-    case installing(Double)          // 0.0 ~ 1.0
-    case listening
-    case transcript(Transcript)
-    case failed(String)
-}
+**A. 포맷 변환**
 
-/// SpeechAnalyzer 한 개를 계속 살려두고, 언어가 바뀌면 모듈만 갈아끼운다.
-/// 기준 커밋이 발화마다 SFSpeechRecognizer 를 새로 만들던 것을 대체한다.
-@MainActor
-public final class SpeechPipeline {
-    private let table: LanguageTable
-    private let sensitivity: DetectorSensitivity
+1. 모델 설치 후 `SpeechAnalyzer.bestAvailableAudioFormat(compatibleWith:)`으로
+   `[detector, transcriber]`의 공통 포맷을 조회한다. nil이면 시작 실패를 보고한다.
+2. `prepareToAnalyze(in:)`에 이 포맷을 전달한다. 마이크 native format이나
+   시스템 오디오의 48kHz stereo 포맷을 그대로 전달하지 않는다.
+3. sink 안에서 입력 포맷을 확인하고 `AVAudioConverter(from:to:)`를 구성한다.
+   변환기는 하나의 직렬 실행 영역에서 사용하며 버퍼마다 새로 만들지 않는다.
+   콜백 종료 후에도 쓸 데이터는 소유한 버퍼에 복사한다.
+4. 출력 용량은 `ceil(inputFrames * outputRate / inputRate)`를 기준으로 확보하고,
+   converter가 입력을 소비하고 출력을 배출할 때까지 처리한다. input block에서 같은 입력을
+   두 번 공급하지 않는다. 출력은 매번 독립된 버퍼에 보관한다.
+5. 변환된 버퍼만 `AnalyzerInput`으로 전달한다. 입력 큐는 최대 약 2초 분량으로 제한하고,
+   초과하면 PCM을 조용히 버리지 말고 오류를 보고한 뒤 실행을 정지한다. 입력 포맷 변경도
+   감지하고 재구성한다. 장치 변경을 무시하지 않는다.
 
-    private var analyzer: SpeechAnalyzer?
-    private var transcriber: SpeechTranscriber?
-    private var detector: SpeechDetector?
-    private var continuation: AsyncStream<AnalyzerInput>.Continuation?
-    private var analysisTask: Task<Void, Never>?
-    private var resultsTask: Task<Void, Never>?
-    private var source: AudioSource?
+근거: [Apple — bestAvailableAudioFormat](https://developer.apple.com/documentation/speech/speechanalyzer/bestavailableaudioformat%28compatiblewith%3A%29).
+분석기는 자동 리샘플링하지 않는다. 변환기의 입력 공급과 출력 프레임 수는 합성 PCM으로 검증한다.
 
-    public private(set) var currentLanguage: CaptionLanguage = .korean
-    public var onEvent: (@MainActor (PipelineEvent) -> Void)?
+**B. 실행 소유권과 취소**
 
-    public init(table: LanguageTable, sensitivity: DetectorSensitivity) {
-        self.table = table
-        self.sensitivity = sensitivity
-    }
+- `@MainActor PipelineController`를 유일한 진입점으로 둔다. `requestStart(configuration:)`,
+  `requestStop()`, `requestReconfigure(configuration:)`은 동기적으로 요청을 받아 generation을
+  즉시 갱신하고 실행 중 작업을 취소한다. worker 하나가 이전 실행을 정리한 뒤 최신 요청을
+  시작한다. 버튼마다 별도의 `Task { stop; start }`를 만들지 않는다.
+- `Run`이 source, analyzer, 입력 continuation, analysis/results/progress 태스크를 소유한다.
+  await 후 공유 프로퍼티를 nil로 만들어 새 실행을 지우지 않는다. 정리는 여러 번 호출해도 안전해야 한다.
+- locale 확인·모델 다운로드·예약·source.start·prepare·setModules의 각 await 뒤에
+  `Task.checkCancellation()`과 generation 일치를 검사한다. 다운로드가 취소를 무시하고
+  완료돼도 캡처는 시작하지 않는다.
+- 진행률 태스크는 `defer { reporter.cancel() }`로 성공·실패·취소 모두 정리한다.
+  설치·결과·오류 이벤트에도 generation을 넣어 현행 Run의 이벤트만 알린다.
+- 정리 순서는 sink 수신 차단 → source.stop 완료 → continuation 종료 → 결과/분석 태스크 취소 →
+  analyzer 종료다. 시작 중 실패에도 같은 정리를 적용한다.
+- source.start가 대기 중이면 소스의 취소 핸들러가 그 대기를 해제한다.
+  worker가 시작 완료만 기다리느라 정지하지 못하는 교착 상태를 만들지 않는다.
+- sensitivity는 실행 configuration에서 읽는다. 변경하면 재구성한다. 언어 전환은 포맷이
+  호환될 때 `setModules`로 처리하고, 아니면 변환기를 안전하게 재구성하거나 안내 후 재시작한다.
 
-    private var detectorLevel: SpeechDetector.SensitivityLevel {
-        switch sensitivity {
-        case .low: .low
-        case .medium: .medium
-        case .high: .high
-        }
-    }
+**C. 전사 이벤트 식별**
 
-    private func makeTranscriber(for language: CaptionLanguage) async throws -> SpeechTranscriber {
-        guard let locale = await SpeechTranscriber.supportedLocale(equivalentTo: language.locale) else {
-            throw NSError(domain: "Captions", code: 20, userInfo: [
-                NSLocalizedDescriptionKey: "\(language.displayName) 전사 모델을 지원하지 않습니다"])
-        }
-        // 주의: SpeechTranscriber.TranscriptionOption 에는 .punctuation 이 없다.
-        // 구두점은 preset 에서 온다.
-        let transcriber = SpeechTranscriber(locale: locale, preset: .progressiveTranscription)
+`Transcript`의 partial/final은 유지하되 이벤트에 `runID`, `utteranceID`, `revision`,
+`sourceLanguage`를 붙인다. `SpeechTranscriber.Result`의 오디오 시간 범위를 이용해
+동일 구간의 volatile 갱신과 final을 같은 ID로 묶는다. 문자열 일치로 중복을 판정하지 않는다.
+확정 구간과 후속 volatile 구간이 교차 도착하는 경우를 테스트하여 과거 구간의 final로
+최신 원문이 되돌아가지 않게 한다. 번역 언어는 이벤트 생성 시점의 값으로 고정한다.
 
-        if let request = try await AssetInventory.assetInstallationRequest(supporting: [transcriber]) {
-            let progress = request.progress
-            let reporter = Task { [weak self] in
-                while !Task.isCancelled && !progress.isFinished {
-                    let fraction = progress.fractionCompleted
-                    await MainActor.run { self?.onEvent?(.installing(fraction)) }
-                    try? await Task.sleep(for: .milliseconds(400))
-                }
-            }
-            try await request.downloadAndInstall()
-            reporter.cancel()
-        }
-        _ = try? await AssetInventory.reserve(locale: locale)
-        return transcriber
-    }
+- [ ] **Step 5a: 회귀 테스트**
 
-    public func start(source: AudioSource, language: CaptionLanguage) async {
-        do {
-            self.source = source
-            currentLanguage = language
-
-            let transcriber = try await makeTranscriber(for: language)
-            let detector = SpeechDetector(
-                detectionOptions: .init(sensitivityLevel: detectorLevel),
-                reportResults: false)
-            self.transcriber = transcriber
-            self.detector = detector
-
-            let analyzer = SpeechAnalyzer(modules: [detector, transcriber])
-            self.analyzer = analyzer
-
-            let (stream, continuation) = AsyncStream.makeStream(of: AnalyzerInput.self)
-            self.continuation = continuation
-
-            let format = try await source.start { buffer in
-                continuation.yield(AnalyzerInput(buffer: buffer))
-            }
-            try await analyzer.prepareToAnalyze(in: format)
-
-            observeResults(of: transcriber)
-            analysisTask = Task { [weak self] in
-                do { _ = try await analyzer.analyzeSequence(stream) }
-                catch {
-                    await MainActor.run { self?.onEvent?(.failed("분석 오류: \(error.localizedDescription)")) }
-                }
-            }
-            onEvent?(.listening)
-        } catch {
-            onEvent?(.failed("시작 실패: \(error.localizedDescription)"))
-        }
-    }
-
-    private func observeResults(of transcriber: SpeechTranscriber) {
-        resultsTask?.cancel()
-        resultsTask = Task { [weak self] in
-            do {
-                for try await result in transcriber.results {
-                    let text = String(result.text.characters)
-                        .trimmingCharacters(in: .whitespacesAndNewlines)
-                    guard !text.isEmpty else { continue }
-                    let transcript: Transcript = result.isFinal ? .final(text) : .partial(text)
-                    await MainActor.run { self?.onEvent?(.transcript(transcript)) }
-                }
-            } catch {
-                await MainActor.run { self?.onEvent?(.failed("전사 오류: \(error.localizedDescription)")) }
-            }
-        }
-    }
-
-    /// 오디오 입력을 끊지 않고 언어만 바꾼다. 기준 커밋처럼 엔진을 내렸다 올리지 않는다.
-    public func switchLanguage(to language: CaptionLanguage) async {
-        guard language != currentLanguage,
-              let analyzer, let detector else { return }
-        do {
-            let transcriber = try await makeTranscriber(for: language)
-            try await analyzer.setModules([detector, transcriber])
-            self.transcriber = transcriber
-            currentLanguage = language
-            observeResults(of: transcriber)
-            onEvent?(.listening)
-        } catch {
-            onEvent?(.failed("언어 전환 실패: \(error.localizedDescription)"))
-        }
-    }
-
-    public func stop() async {
-        source?.stop()
-        source = nil
-        continuation?.finish()
-        continuation = nil
-        analysisTask?.cancel(); analysisTask = nil
-        resultsTask?.cancel(); resultsTask = nil
-        if let analyzer { await analyzer.cancelAndFinishNow() }
-        analyzer = nil; transcriber = nil; detector = nil
-    }
-}
-```
+실제 장치 없이 가짜 소스와 수동 재개 continuation으로 검증한다. 48kHz stereo / 44.1kHz mono
+합성 입력에서 선택한 분석 포맷의 rate·channels·프레임 수·연속성을 확인한다.
+시작 중 정지, 시작 실패, 연속 전환, 이전 결과/오류 도착, 다운로드 실패 시 진행률 태스크 종료,
+같은 문장을 다른 구간에서 두 번 말하는 경우를 추가한다.
 
 - [ ] **Step 6: `main.swift` 에서 기존 인식 코드 제거하고 파이프라인 배선**
 
@@ -1095,49 +990,28 @@ public final class SpeechPipeline {
 **추가**할 것 — `import CaptionsCore` 와 아래 배선:
 
 ```swift
-private let pipeline = SpeechPipeline(table: .default, sensitivity: .medium)
-private var recognitionLanguage: CaptionLanguage = .korean
-
+// AppDelegate는 @MainActor. controller와 currentConfiguration은 Step 5에서 연결한다.
 private func startListening() {
-    guard !running else { return }
-    running = true
-    toggleButton.title = "정지"
-    pipeline.onEvent = { [weak self] event in self?.handle(event) }
-    Task { await pipeline.start(source: MicSource(), language: recognitionLanguage) }
-}
-
-private func handle(_ event: PipelineEvent) {
-    switch event {
-    case .installing(let fraction):
-        statusLabel.stringValue = "음성 모델 설치 중 · \(Int(fraction * 100))%"
-    case .listening:
-        statusLabel.stringValue = "● 듣는 중 · \(pipeline.currentLanguage.displayName)"
-    case .transcript(let transcript):
-        originalLabel.stringValue = CaptionText.tail(transcript.text)
-        scheduleTranslation(of: transcript)
-        if transcript.isFinal { adaptLanguage(from: transcript.text) }
-    case .failed(let message):
-        statusLabel.stringValue = message
-        running = false
-        toggleButton.title = "다시 시작"
-    }
-}
-
-/// 확정 전사에서만 언어를 재판단한다. 부분 결과로 바꾸면 문장 도중에 언어가 튄다.
-private func adaptLanguage(from text: String) {
-    guard languageMode == .auto else { return }
-    let detected = LanguageTable.default.detect(text, current: pipeline.currentLanguage)
-    guard detected != pipeline.currentLanguage else { return }
-    Task { await pipeline.switchLanguage(to: detected) }
+    controller.requestStart(configuration: currentConfiguration)
 }
 
 private func stopListening() {
-    Task { await pipeline.stop() }
-    running = false
-    toggleButton.title = "시작"
-    statusLabel.stringValue = "일시 정지"
+    invalidateCaptions() // Task 6부터 translator.reset()도 동기적으로 호출
+    controller.requestStop()
 }
 ```
+
+`currentConfiguration`은 설정에서 만든 소스·언어·민감도의 스냅샷이다. 자동 모드의 최초
+언어는 한국어, 고정 모드는 저장한 ID를 쓴다. `invalidateCaptions()`는 기존 번역 작업과
+clear 타이머를 취소하고 이후 Task 6에서 번역 세대도 무효화한다.
+`running`과 버튼 상태는 controller의 starting/listening/stopping/stopped/failed 상태에서
+한 번에 갱신한다. 시작 요청만 보냈다고 listening 상태로 바꾸지 않는다.
+전사 수신 시 원문 갱신, 이전 번역 무효화, 번역 요청, 유지 타이머 재예약을 함께 처리한다.
+
+자동 모드는 UI에 `자동 (실험)`으로 표시하고 기본값은 고정 한국어로 둔다. 문자열 분류는
+현재 locale의 오인식에 종속되므로 자동 전환 성공을 보장하지 않는다. 실험 모드에서만
+final 문자열로 전환을 제안하며, 전환 실행은 반드시 controller를 거친다.
+수동 한국어/영어 전환과 설정의 fixed ID를 같은 configuration 경로로 연결한다.
 
 `scheduleTranslation(of:)` 는 아직 기존 `String` 기반 구현을 쓴다. 시그니처만
 `Transcript` 를 받도록 바꾸고 내부에서 `transcript.text` 를 넘긴다. Task 6 에서 교체한다.
@@ -1155,8 +1029,9 @@ Run: `./run.sh`
 1. 최초 실행 시 "음성 모델 설치 중 · N%" 가 뜨거나, 이미 설치됐으면 바로 "● 듣는 중".
 2. 한국어로 말하면 자막이 **문장 도중에 초기화되지 않고** 이어서 자란다.
    (기준 커밋은 `voiceDetected()` 가 라벨을 비워서 자막이 끊겼다.)
-3. 영어로 한 문장 말한 뒤, 다음 발화에서 언어가 전환되는지.
-4. 한국어↔영어를 오갈 때 오디오가 끊기지 않는지.
+3. 한국어/영어 고정 모드에서 각각 인식되고 수동 전환이 적용되는지.
+4. 자동 모드가 실험 기능으로 표시되는지. 자동 전환 성공률은 별도로 기록하고 수동 전환 결과와 혼동하지 않는다.
+5. 다운로드/시작 중 정지하면 나중에 캡처가 켜지지 않는지. 빠른 시작·정지·소스 전환 후 마지막 요청만 남는지.
 
 - [ ] **Step 9: 커밋**
 
@@ -1167,8 +1042,8 @@ git commit -m "feat: replace SFSpeechRecognizer with SpeechAnalyzer pipeline
 Deletes the hand-rolled RMS voice detection, the silence timer that
 restarted recognition every utterance, and the confidence-threshold
 language heuristic. SpeechDetector handles VAD and setModules swaps the
-language without tearing down the audio tap. Language re-detection now
-runs on final transcripts only, so it cannot flip mid-sentence.
+language when the audio formats remain compatible. Manual language
+selection is the supported path; text-based auto switching is experimental.
 
 Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>"
 ```
@@ -1184,12 +1059,16 @@ Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>"
 - Modify: `Sources/LiveBilingualCaptions/main.swift` — `translate(_:)` 463–489줄 제거, `Translator` 배선
 
 **Interfaces:**
-- Consumes: `CaptionLanguage`, `LanguageTable` (Task 2), `Debouncer` (Task 3), `Transcript` (Task 5)
+- Consumes: `CaptionLanguage`, `LanguageTable` (Task 2), `Transcript`와 발화 ID (Task 5)
 - Produces:
   - `public protocol TranslationRefiner: Sendable { func refine(_ draft: String, source: String, context: [String]) async throws -> String }`
   - `public enum PackStatus: Sendable, Equatable { case installed, needsDownload, unsupported }`
   - `public typealias TranslateFunction = @Sendable (String, CaptionLanguage, CaptionLanguage) async -> String?`
-  - `@MainActor public final class Translator` — `init(table: LanguageTable, translate: @escaping TranslateFunction = Translator.onDevice)`, `static let onDevice: TranslateFunction`, `var refiner: TranslationRefiner?`, `var onTranslation: (@MainActor (String, Bool) -> Void)?`, `static func packStatus(from:to:) async -> PackStatus`, `func handle(_ transcript: Transcript, from: CaptionLanguage) async`, `func reset()`
+  - `@MainActor public final class Translator` — `init(table:translate:)`, `onDevice`, `refiner`, `preferredTargetID`, `onTranslation`, `packStatus(from:to:)`, `submit(_:from:captionID:) -> Task<Void, Never>?`, `handle(_:from:captionID:) async` (테스트 편의), `reset()`
+
+번역 디바운스는 submit이 소유한 Task에서 처리한다. 별도 Debouncer actor에 비동기로 취소를
+보내면 reset 직후 새 작업까지 취소하는 경합이 생길 수 있다. 그래서 Task 3에서 Debouncer를
+아예 만들지 않는다 — 여기서 쓰지 않으면 쓰는 곳이 없다.
 
 - [ ] **Step 1: 실패하는 테스트 작성**
 
@@ -1252,12 +1131,13 @@ private let fakeTranslate: TranslateFunction = { text, _, _ in "[번역] " + tex
     #expect(received[1] == ("[번역] 안녕하세요 (보정됨)", true))
 }
 
-@Test @MainActor func 같은_문장을_두_번_보내면_한_번만_보정한다() async {
+@Test @MainActor func 같은_발화의_중복_final은_한_번만_보정한다() async {
     let spy = SpyRefiner()
     let translator = Translator(table: .default, translate: fakeTranslate)
     translator.refiner = spy
-    await translator.handle(.final("같은 문장"), from: .korean)
-    await translator.handle(.final("같은 문장"), from: .korean)
+    let captionID = UUID()
+    await translator.handle(.final("같은 문장"), from: .korean, captionID: captionID)
+    await translator.handle(.final("같은 문장"), from: .korean, captionID: captionID)
     #expect(await spy.recorded().count == 1)
 }
 
@@ -1265,9 +1145,19 @@ private let fakeTranslate: TranslateFunction = { text, _, _ in "[번역] " + tex
     let spy = SpyRefiner()
     let translator = Translator(table: .default, translate: fakeTranslate)
     translator.refiner = spy
-    await translator.handle(.final("문장"), from: .korean)
+    let captionID = UUID()
+    await translator.handle(.final("문장"), from: .korean, captionID: captionID)
     translator.reset()
-    await translator.handle(.final("문장"), from: .korean)
+    await translator.handle(.final("문장"), from: .korean, captionID: captionID)
+    #expect(await spy.recorded().count == 2)
+}
+
+@Test @MainActor func 같은_문장도_다른_발화면_각각_보정한다() async {
+    let spy = SpyRefiner()
+    let translator = Translator(table: .default, translate: fakeTranslate)
+    translator.refiner = spy
+    await translator.handle(.final("네"), from: .korean, captionID: UUID())
+    await translator.handle(.final("네"), from: .korean, captionID: UUID())
     #expect(await spy.recorded().count == 2)
 }
 ```
@@ -1304,13 +1194,23 @@ public typealias TranslateFunction = @Sendable (String, CaptionLanguage, Caption
 public final class Translator {
     private let table: LanguageTable
     private let translate: TranslateFunction
-    private let debouncer = Debouncer(interval: .milliseconds(220))
-
-    private var lastTranslatedSource = ""
-    private var refinedSources: Set<String> = []
+    private var pending: Task<Void, Never>?
+    private var generation: UInt64 = 0
+    private struct SubmissionKey: Equatable {
+        let captionID: UUID
+        let text: String
+        let sourceID: String
+        let targetID: String
+        let isFinal: Bool
+    }
+    private var lastSubmission: SubmissionKey?
+    private var refinedIDs: [UUID] = []
     private var recentFinals: [String] = []
 
-    public var refiner: TranslationRefiner?
+    public var preferredTargetID: String?
+    public var refiner: TranslationRefiner? {
+        didSet { reset() } // 끄기·키 교체 시 이미 진행 중인 보정 응답도 무효화
+    }
     /// (번역문, 보정됨) — 보정됨이 true 면 크로스페이드로 교체하라는 뜻.
     public var onTranslation: (@MainActor (String, Bool) -> Void)?
 
@@ -1341,46 +1241,74 @@ public final class Translator {
     }
 
     public func reset() {
-        lastTranslatedSource = ""
-        refinedSources.removeAll()
+        generation &+= 1
+        pending?.cancel()
+        pending = nil
+        lastSubmission = nil
+        refinedIDs.removeAll()
         recentFinals.removeAll()
-        Task { await debouncer.cancel() }
     }
 
-    public func handle(_ transcript: Transcript, from source: CaptionLanguage) async {
-        guard let target = table.target(for: source) else { return }
-        let text = transcript.text
-        guard !text.isEmpty else { return }
-
-        if transcript.isFinal {
-            // 확정 문장은 기다리지 않는다. 보정 기회도 여기서만 준다.
-            await debouncer.cancel()
-            await emit(text, from: source, to: target, isFinal: true)
-        } else {
-            guard text != lastTranslatedSource else { return }
-            await debouncer.schedule { [weak self] in
-                await self?.emit(text, from: source, to: target, isFinal: false)
-            }
+    /// UI 이벤트에서 직접 호출한다. Task로 감싸기 전에 이전 요청을 무효화해야 한다.
+    /// captionID는 파이프라인이 발급한 발화 ID. 같은 발화의 partial/final에 동일 ID를 쓴다.
+    @discardableResult
+    public func submit(_ transcript: Transcript, from source: CaptionLanguage,
+                       captionID: UUID) -> Task<Void, Never>? {
+        guard let target = table.target(for: source, preferredID: preferredTargetID),
+              !transcript.text.isEmpty else {
+            reset()
+            return nil
         }
+        let key = SubmissionKey(captionID: captionID, text: transcript.text,
+                                sourceID: source.id, targetID: target.id, isFinal: transcript.isFinal)
+        if key == lastSubmission { return pending } // 중복 final로 진행 중 보정까지 취소하지 않는다
+        lastSubmission = key
+        generation &+= 1
+        let ticket = generation
+        pending?.cancel()
+        pending = nil
+        let text = transcript.text
+        let task = Task { [weak self] in
+            guard let self else { return }
+            if !transcript.isFinal {
+                do { try await Task.sleep(for: .milliseconds(220)) }
+                catch { return }
+            }
+            guard self.isCurrent(ticket) else { return }
+            await self.emit(text, from: source, to: target, isFinal: transcript.isFinal,
+                            captionID: captionID, ticket: ticket)
+        }
+        pending = task
+        return task
+    }
+
+    /// 테스트·직렬 호출용. 앱 이벤트 경로는 동기 submit을 쓴다.
+    public func handle(_ transcript: Transcript, from source: CaptionLanguage,
+                       captionID: UUID = UUID()) async {
+        let task = submit(transcript, from: source, captionID: captionID)
+        await task?.value
+    }
+
+    private func isCurrent(_ ticket: UInt64) -> Bool {
+        ticket == generation && !Task.isCancelled
     }
 
     private func emit(_ text: String, from source: CaptionLanguage,
-                      to target: CaptionLanguage, isFinal: Bool) async {
-        guard let draft = await translate(text, source, target) else { return }
-        lastTranslatedSource = text
+                      to target: CaptionLanguage, isFinal: Bool,
+                      captionID: UUID, ticket: UInt64) async {
+        guard let draft = await translate(text, source, target),
+              isCurrent(ticket) else { return }
         onTranslation?(draft, false)
-        guard isFinal else { return }
-
+        guard isCurrent(ticket), isFinal, !refinedIDs.contains(captionID) else { return }
+        let context = recentFinals // 현재 문장을 '직전 문장들'에 중복해서 넣지 않는다
         recentFinals.append(text)
         if recentFinals.count > 3 { recentFinals.removeFirst() }
-        await refine(draft, source: text)
-    }
-
-    private func refine(_ draft: String, source: String) async {
-        guard let refiner, !refinedSources.contains(source) else { return }
-        refinedSources.insert(source)
+        guard let refiner else { return }
+        refinedIDs.append(captionID)
+        if refinedIDs.count > 256 { refinedIDs.removeFirst() }
         guard let improved = try? await refiner.refine(
-            draft, source: source, context: recentFinals),
+            draft, source: text, context: context),
+              isCurrent(ticket), !improved.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
               improved != draft
         else { return }
         onTranslation?(improved, true)
@@ -1391,7 +1319,7 @@ public final class Translator {
 - [ ] **Step 4: 테스트 통과 확인**
 
 Run: `./test.sh`
-Expected: 27개 PASS
+Expected: 기존 테스트와 Step 5a의 응답 순서 회귀 테스트 전부 PASS. 실제 총수는 실행 결과로 기록한다.
 
 - [ ] **Step 5: `main.swift` 에서 Google 번역 제거**
 
@@ -1418,9 +1346,30 @@ translator.onTranslation = { [weak self] text, refined in
     }
 }
 
-// handle(_:) 의 .transcript 케이스에서:
-Task { await translator.handle(transcript, from: pipeline.currentLanguage) }
+// 현재 전사 이벤트를 받아 원문을 갱신하는 동일 MainActor 호출 안에서:
+// transcript / sourceLanguage / utteranceID는 이벤트에 실린 값이다.
+translator.submit(transcript, from: sourceLanguage, captionID: utteranceID)
 ```
+
+`submit`은 Task로 감싸지 않는다. 원문을 갱신할 때 이전 번역 표시도 비우고 새 요청을 등록한다.
+지우기·정지·실행 변경·언어쌍 변경·유지 시간 만료 시 `translator.reset()`을 동기적으로 호출한다.
+AppKit 애니메이션 완료 콜백에도 현재 표시 revision 검사를 넣어 이전 문장을 뒤늦게 대입하지 않는다.
+Task 7의 SwiftUI 이주 전에도 이 검사는 필요하다.
+
+- [ ] **Step 5a: 응답 순서 회귀 테스트**
+
+continuation을 가진 가짜 번역기/보정기를 넣어 응답을 원하는 순서로 해제한다.
+다음 케이스에서 과거 응답이 방출되지 않는지 검사한다. 가짜는 의도적으로 취소를 무시한다.
+
+1. A partial 요청 → B final 요청 → B 응답 → A 응답.
+2. A final 초안 표시 → B 원문 갱신 → A LLM 응답.
+3. 번역/보정 대기 중 reset → 이전 응답, reset 직후 새 요청 → 이전 응답.
+4. 보정 끄기 또는 키 교체 → 기존 보정 응답.
+5. 같은 문자열·다른 발화 ID는 각각 보정, 같은 발화 ID의 중복 final은 한 번만 보정.
+6. 언어쌍 변경과 유지 시간 만료 뒤 늦은 응답.
+
+`refinedIDs`는 최근 중복 final 방지용이다. 오래된 전사 이벤트 폐기는 Task 5가 담당한다.
+애니메이션도 동일한 표시 revision 검사를 거쳐야 한다.
 
 - [ ] **Step 6: Google 흔적이 없는지 확인**
 
@@ -1433,7 +1382,7 @@ Expected: 출력 없음
 2. Wi-Fi 를 끈다.
 3. 한국어로 말한다 → 번역이 나와야 한다.
 4. 번역이 안 나오면 언어팩 미설치다. 시스템 설정 → 일반 → 언어 및 지역 → 번역 언어에서
-   한국어·영어를 받는다. (Task 8 이 이 안내를 앱 안으로 옮긴다.)
+   한국어·영어를 받는다. (Task 7이 언어팩 다운로드를 앱 안으로 옮긴다.)
 5. Wi-Fi 를 다시 켠다.
 
 - [ ] **Step 8: 커밋**
@@ -1476,7 +1425,7 @@ import CaptionsCore
 @MainActor
 final class CaptionState {
     var original = "말을 시작하면 원문이 여기에 표시됩니다"
-    var translated = "Your translation will appear here"
+    var translated = "번역이 여기에 표시됩니다"
     var status = "준비 중…"
     var fontSize: Double = 20
     var isRunning = false
@@ -1582,15 +1531,24 @@ app.setActivationPolicy(.accessory)
 app.run()
 ```
 
-`@main` 어트리뷰트를 제거한다. `main.swift` 라는 파일명 자체가 진입점이므로
-`@main` 과 함께 쓰면 `'main' attribute cannot be used in a module that contains top-level code` 로 깨진다.
-`Package.swift` 에서 `-parse-as-library` 를 주지 않으므로 이 형태가 맞다.
+이 단계에서는 최상위 코드가 있는 `main.swift`로 진입점을 통일하고 기존 `@main` 선언은 제거한다.
+Task 1에서 `AppMain.swift`로 옮겼다면 중복 진입점이 남지 않도록 해당 파일도 함께 정리한다.
+SwiftPM의 `@main` 감지 동작과 수동 swiftc 호출을 혼동하지 않는다.
+
+- [ ] **Step 3a: 실행 타깃 Swift 6 전환**
+
+`AppDelegate`를 `@MainActor`로 선언하고 `Package.swift`의 실행 타깃을 `.swiftLanguageMode(.v6)`으로
+바꾼다. NotificationCenter·오디오·URLSession·애니메이션 콜백의 actor 경계를 각각 정리한다.
+`.main` 큐 지정만으로 컴파일러의 actor 격리가 보장된다고 가정하지 않는다. 비격리 콜백에서
+UI 변경은 `Task { @MainActor in ... }`로 전달하고, Sendable이 아닌 오디오 버퍼를 그대로 넘기지 않는다.
+`@unchecked Sendable`로 오류를 일괄 억제하지 않는다. 이전 타깃의 Swift 5 예외는 이 단계에서 제거한다.
 
 `Sources/LiveBilingualCaptions/AppDelegate.swift` — 나머지 전부. 창 생성은 이렇게 바뀐다:
 
 ```swift
 private func buildWindow() {
-    let size = NSSize(width: 560, height: 188)
+    // 저장값의 유효 범위와 화면 맞춤은 Task 9의 restorePanelFrame에서 처리한다.
+    let size = NSSize(width: settings.panelWidth ?? 560, height: settings.panelHeight ?? 188)
     panel = NSPanel(contentRect: NSRect(origin: .zero, size: size),
                     styleMask: [.borderless], backing: .buffered, defer: false)
     // 발표·전체화면 위에도 자막이 보여야 한다.
@@ -1631,7 +1589,7 @@ private func buildWindow() {
 - [ ] **Step 4: 빌드 확인**
 
 Run: `./build.sh`
-Expected: 성공
+Expected: 성공. 이 단계 이후 실행 타깃도 Swift 6 모드로 빌드돼야 한다.
 
 - [ ] **Step 5: 수동 스모크**
 
@@ -1664,100 +1622,48 @@ Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>"
 스펙 §6.1 의 두 번째 구현. 이 태스크로 "회의 모드" 문구가 사실이 된다.
 
 **Files:**
-- Create: `Sources/CaptionsCore/SystemAudioSource.swift`
+- Create: `Sources/CaptionsCore/SystemAudioSource.swift`, `Sources/CaptionsCore/FormatGate.swift`, `Tests/CaptionsCoreTests/SystemAudioSourceTests.swift`, `Tests/CaptionsCoreTests/FormatGateTests.swift`
 - Modify: `Sources/LiveBilingualCaptions/AppDelegate.swift`, `Sources/LiveBilingualCaptions/CaptionOverlay.swift`
 
 **Interfaces:**
 - Consumes: `AudioSource`, `AudioSourceError` (Task 4), `AudioSourceKind` (Task 3)
-- Produces: `public final class SystemAudioSource: NSObject, AudioSource, SCStreamOutput`
+- Produces: `@MainActor SystemAudioSource: AudioSource`, 별도 `SCStreamOutput`/`SCStreamDelegate` 어댑터, 취소 가능한 `FormatGate`
 
 - [ ] **Step 1: `SystemAudioSource` 작성**
 
 `SCStream` 은 `CMSampleBuffer` 를 주므로 `AVAudioPCMBuffer` 로 바꿔야 한다.
 
-`Sources/CaptionsCore/SystemAudioSource.swift`:
-```swift
-import AVFoundation
-import ScreenCaptureKit
+기존의 `startCapture()` 후 continuation 등록 코드는 첫 버퍼가 먼저 오면 영원히 대기하므로
+삭제했다. 아래 시작/정지 계약을 구현하고 가짜 콜백으로 검증한 뒤 실제 SCStream에 연결한다.
 
-/// ScreenCaptureKit 으로 시스템 출력 오디오를 잡는다. 화면 기록 권한이 필요하다.
-/// 화면 픽셀은 쓰지 않지만 SCStream 이 오디오만 주는 모드를 제공하지 않으므로
-/// 최소 크기 비디오를 함께 받고 버린다.
-public final class SystemAudioSource: NSObject, AudioSource, SCStreamOutput {
-    private var stream: SCStream?
-    private var sink: (@Sendable (AVAudioPCMBuffer) -> Void)?
-    private var formatContinuation: CheckedContinuation<AVAudioFormat, Error>?
-    private var resolvedFormat: AVAudioFormat?
-    private let queue = DispatchQueue(label: "SystemAudioSource")
+- `@MainActor SystemAudioSource`가 스트림의 시작·정지를 관리한다. `SCStreamOutput`과
+  `SCStreamDelegate` 콜백은 별도 어댑터로 분리한다. sample queue에서 MainActor 프로퍼티를
+  직접 수정하지 않는다. 콜백 데이터는 그 큐에서 PCM 복사·변환하고, 오류/상태만 안전하게 전달한다.
+- 시작마다 새로운 실행 토큰과 일회성 `FormatGate`를 생성한다. gate는 `pending / resolved(Result)`
+  상태이며 **결과를 먼저 받아도 저장한다.** wait 등록이 나중이면 저장된 결과를 즉시 반환한다.
+  lock 또는 단일 actor로 상태를 보호하고 continuation은 정확히 한 번만 재개한다.
+- gate와 sink를 설정한 뒤 `startCapture()`를 호출한다. 첫 유효 오디오 버퍼로 포맷을 결정한다.
+  캡처 시작 실패·delegate 오류·취소·정지·5초 내 첫 버퍼 미도착도 gate를 오류로 완료한다.
+  `withTaskCancellationHandler`의 onCancel은 gate 대기를 즉시 해제한다.
+- 무음에서 첫 버퍼가 오지 않아도 무한 대기하지 않는다. 제한 시간 종료 시 스트림을 정리하고
+  `오디오 입력을 기다리다 중단했습니다. 재생 후 다시 시작하세요`를 표시한다.
+- `start()`는 `startCapture()` 성공과 첫 포맷 확보를 모두 확인한 후 반환한다. 반환 전에
+  실행 토큰을 검사한다. 실패하면 해당 스트림의 `stopCapture()`까지 기다린다.
+- `stop() async`는 먼저 토큰을 무효화하고 gate를 CancellationError로 완료하고 sink를 차단한 뒤
+  `stopCapture()`를 await한다. 이전 스트림 콜백은 토큰으로 버린다. 다음 시작은 새 gate와 포맷을 쓴다.
+- 설정: `capturesAudio = true`, `excludesCurrentProcessAudio = true`, `sampleRate = 48_000`,
+  `channelCount = 2`. 실제 콜백 포맷이 설정과 다르면 실제 포맷을 변환기에 전달한다.
+- 버퍼가 유효하고 `numSamples > 0`인지 확인한다. `AVAudioPCMBuffer`를 할당한 뒤
+  `sampleBuffer.copyPCMData(fromRange: 0..<sampleBuffer.numSamples, into: buffer.mutableAudioBufferList)`로
+  복사한다. 변환 실패를 조용히 삼키지 않고 현재 실행 오류로 전달한다.
 
-    public func start(_ sink: @escaping @Sendable (AVAudioPCMBuffer) -> Void) async throws -> AVAudioFormat {
-        self.sink = sink
+- [ ] **Step 1a: 시작 경합 테스트**
 
-        let content = try await SCShareableContent.excludingDesktopWindows(
-            false, onScreenWindowsOnly: true)
-        guard let display = content.displays.first else { throw AudioSourceError.noDisplay }
-
-        let config = SCStreamConfiguration()
-        config.capturesAudio = true
-        config.excludesCurrentProcessAudio = true   // 자기 소리를 되먹지 않는다
-        config.sampleRate = 48_000
-        config.channelCount = 2
-        config.width = 2                            // 비디오는 안 쓰므로 최소로
-        config.height = 2
-        config.minimumFrameInterval = CMTime(value: 1, timescale: 1)
-
-        let filter = SCContentFilter(display: display, excludingWindows: [])
-        let stream = SCStream(filter: filter, configuration: config, delegate: nil)
-        try stream.addStreamOutput(self, type: .audio, sampleHandlerQueue: queue)
-        self.stream = stream
-        try await stream.startCapture()
-
-        // 첫 오디오 버퍼가 와야 실제 포맷을 알 수 있다.
-        return try await withCheckedThrowingContinuation { continuation in
-            self.formatContinuation = continuation
-        }
-    }
-
-    public func stop() {
-        let stream = self.stream
-        self.stream = nil
-        self.sink = nil
-        Task { try? await stream?.stopCapture() }
-    }
-
-    public func stream(_ stream: SCStream, didOutputSampleBuffer sampleBuffer: CMSampleBuffer,
-                       of type: SCStreamOutputType) {
-        guard type == .audio,
-              let description = sampleBuffer.formatDescription,
-              let streamBasicDescription = description.audioStreamBasicDescription
-        else { return }
-
-        if resolvedFormat == nil {
-            var asbd = streamBasicDescription
-            guard let format = AVAudioFormat(streamDescription: &asbd) else { return }
-            resolvedFormat = format
-            formatContinuation?.resume(returning: format)
-            formatContinuation = nil
-        }
-        guard let format = resolvedFormat else { return }
-
-        let frames = AVAudioFrameCount(sampleBuffer.numSamples)
-        guard frames > 0,
-              let buffer = AVAudioPCMBuffer(pcmFormat: format, frameCapacity: frames)
-        else { return }
-        buffer.frameLength = frames
-
-        do {
-            try sampleBuffer.copyPCMData(
-                fromRange: 0..<sampleBuffer.numSamples,
-                into: buffer.mutableAudioBufferList)
-            sink?(buffer)
-        } catch {
-            return
-        }
-    }
-}
-```
+`SystemAudioSourceTests.swift` / `FormatGateTests.swift`에 다음을 추가한다:
+결과가 wait보다 먼저 도착, wait 후 첫 버퍼 도착, 무음 제한 시간, 시작 실패,
+대기 중 정지/취소, stop과 첫 버퍼 동시 도착, 같은 소스 재시작, 이전 토큰 콜백 도착.
+시계를 주입하고 gate를 수동으로 완료해 실제 5초 sleep 없이 검증한다.
+모든 경로에서 대기가 종료되고 continuation 중복 재개가 없어야 한다.
 
 - [ ] **Step 2: 빌드 확인**
 
@@ -1776,18 +1682,15 @@ private func makeSource() -> AudioSource {
 }
 
 private func cycleAudioSource() {
-    settings.audioSource = settings.audioSource == .microphone ? .systemAudio : .microphone
-    settings.save(to: .standard)
-    state.status = "오디오 소스: \(settings.audioSource.displayName)"
-    guard running else { return }
-    Task {
-        await pipeline.stop()
-        await pipeline.start(source: makeSource(), language: pipeline.currentLanguage)
-    }
+    var updated = settings
+    updated.audioSource = settings.audioSource == .microphone ? .systemAudio : .microphone
+    apply(updated) // Step 5 controller와 Task 9의 단일 설정 적용 경로
 }
 ```
 
-`startListening()` 의 `MicSource()` 를 `makeSource()` 로 바꾼다.
+`makeSource()`는 controller가 configuration의 소스 종류로 새 Run을 만들 때 사용한다.
+`apply`의 최소 버전을 이 태스크에서 먼저 연결하고 Task 9에서 모든 설정으로 확장한다.
+현재 listening뿐 아니라 starting 중 변경에도 마지막 configuration만 적용한다.
 
 - [ ] **Step 4: `CaptionOverlay` 에 소스 버튼 추가**
 
@@ -1848,7 +1751,7 @@ import CaptionsCore
 struct SettingsView: View {
     @Binding var settings: Settings
     var table: LanguageTable
-    var onChange: (Settings) -> Void
+    var availability: LanguageAvailabilityState
 
     var body: some View {
         Form {
@@ -1866,8 +1769,22 @@ struct SettingsView: View {
             }
             Section("언어") {
                 Picker("인식 언어", selection: languageSelection) {
-                    Text("자동").tag("auto")
-                    ForEach(table.languages) { Text($0.displayName).tag($0.id) }
+                    Text("자동 (실험)").tag("auto")
+                    ForEach(table.languages) {
+                        Text($0.displayName).tag($0.id)
+                            .disabled(availability.disabledLanguageIDs.contains($0.id))
+                    }
+                }
+                Text("자동 모드는 잘못 인식된 문장으로 언어를 판단할 수 있습니다. 정확한 전환은 언어를 직접 선택하세요.")
+                    .font(.caption).foregroundStyle(.secondary)
+                if table.languages.count >= 3 {
+                    Picker("기본 번역 대상", selection: $settings.preferredTargetID) {
+                        Text("첫 번째 다른 언어").tag(nil as String?)
+                        ForEach(table.languages) {
+                            Text($0.displayName).tag(Optional($0.id))
+                                .disabled(availability.disabledTargetIDs.contains($0.id))
+                        }
+                    }
                 }
             }
             Section("자막") {
@@ -1887,7 +1804,7 @@ struct SettingsView: View {
         }
         .formStyle(.grouped)
         .frame(width: 420)
-        .onChange(of: settings) { _, new in onChange(new) }
+        // Binding setter가 변경 전후 비교와 apply를 수행한다. 별도 onChange로 다시 적용하지 않는다.
     }
 
     private var languageSelection: Binding<String> {
@@ -1911,6 +1828,14 @@ struct SettingsView: View {
 private var statusItem: NSStatusItem?
 private var settingsWindow: NSWindow?
 
+// Observation import 필요. 설정을 직접 대입하는 경로는 apply 하나뿐이다.
+@Observable @MainActor
+final class SettingsStore {
+    var value = Settings.load(from: .standard)
+}
+private let settingsStore = SettingsStore()
+private var settings: Settings { settingsStore.value }
+
 private func buildStatusItem() {
     let item = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
     item.button?.title = "자막"
@@ -1930,12 +1855,13 @@ private func buildStatusItem() {
         return
     }
     let view = SettingsView(
-        settings: Binding(get: { self.settings }, set: { self.settings = $0 }),
+        settings: Binding(get: { self.settings }, set: { self.apply($0) }),
         table: .default,
-        onChange: { [weak self] new in self?.apply(new) })
+        availability: availability)
     let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 420, height: 480),
                           styleMask: [.titled, .closable], backing: .buffered, defer: false)
     window.title = "Live Bilingual Captions 설정"
+    window.isReleasedWhenClosed = false
     window.contentView = NSHostingView(rootView: view)
     window.center()
     window.makeKeyAndOrderFront(nil)
@@ -1944,18 +1870,53 @@ private func buildStatusItem() {
 }
 
 private func apply(_ new: Settings) {
-    let sourceChanged = new.audioSource != settings.audioSource
-    settings = new
-    settings.save(to: .standard)
+    let old = settings // Binding setter가 이전 값을 덮어쓰기 전에 비교한다.
+    guard old != new else { return }
+    let captureChanged = old.audioSource != new.audioSource
+        || old.languageMode != new.languageMode
+        || old.detectorSensitivity != new.detectorSensitivity
+    let pairChanged = old.preferredTargetID != new.preferredTargetID
+        || old.languageMode != new.languageMode
+    settingsStore.value = new
+    new.save(to: .standard)
     state.fontSize = new.fontSize
-    if sourceChanged, running {
-        Task {
-            await pipeline.stop()
-            await pipeline.start(source: makeSource(), language: pipeline.currentLanguage)
-        }
+    state.audioSourceName = new.audioSource.displayName
+    translator.preferredTargetID = new.preferredTargetID
+    if captureChanged || pairChanged {
+        invalidateCaptions()
+    }
+    if captureChanged {
+        // stopped면 다음 시작용 설정만 갱신. starting/listening이면 직렬로 재구성한다.
+        controller.requestReconfigure(configuration: currentConfiguration)
+    }
+    if pairChanged {
+        refreshLanguagePairAvailability()
+    }
+    if old.captionHoldSeconds != new.captionHoldSeconds {
+        rescheduleCaptionClear()
+    }
+    if old.refinementEnabled != new.refinementEnabled {
+        updateRefiner() // Task 10에서 구현. 그전에는 미연결 토글을 표시하지 않는다.
     }
 }
 ```
+
+`currentConfiguration`은 매번 새 settings에서 만든다. 최초 실행도 설정을 읽은 뒤 fontSize,
+audioSourceName, 고정 언어, preferredTargetID, detectorSensitivity를 반영하고 controller를 구성한다.
+`requestReconfigure`는 중지 중인 앱을 임의로 시작하지 않는다.
+`rescheduleCaptionClear()`는 마지막 원문 갱신 시각부터 새 유지 시간을 계산하고 이미 만료됐으면
+즉시 지운다. 타이머 종료 시에도 `translator.reset()`을 호출해 늦은 응답으로 다시 표시되지 않게 한다.
+
+`refreshLanguagePairAvailability()`를 구현한다. 음성 locale 지원 여부와 번역의 **방향별** 상태를
+조회한다. 고정 원문→선택 대상, 원문 후보→해결된 대상을 각각 판정한다.
+`.unsupported`만 비활성화하고 `.supported`에는 다운로드 안내를 표시한다.
+비동기 조회 결과도 세대로 관리해 이전 언어쌍의 결과가 새 선택지를 덮어쓰지 않게 한다.
+`@Observable @MainActor LanguageAvailabilityState`에 `disabledLanguageIDs`, `disabledTargetIDs`,
+다운로드 필요 언어쌍을 저장한다. AppDelegate의 `availability`와 SettingsView가 이 인스턴스를 공유한다.
+조회 완료와 원문 언어 변경에 따라 갱신한다. 저장된 미지원 조합은 원문만 표시하고 설정 수정을 안내한다.
+controller의 현행 청취/전사 이벤트를 받을 때 `state.sourceLanguage`를 갱신하고
+`table.target(for:preferredID:)`로 `state.targetLanguage`도 갱신한다. 시작 전에는 저장 설정으로
+초기화한다. 이 두 값이 Task 7의 언어팩 다운로드 작업 ID에 반영돼야 한다.
 
 - [ ] **Step 3: 창 위치 저장 배선**
 
@@ -1964,12 +1925,24 @@ private func apply(_ new: Settings) {
 NotificationCenter.default.addObserver(
     forName: NSWindow.didMoveNotification, object: panel, queue: .main
 ) { [weak self] _ in
-    guard let self, let origin = self.panel?.frame.origin else { return }
-    self.settings.panelOriginX = origin.x
-    self.settings.panelOriginY = origin.y
-    self.settings.save(to: .standard)
+    Task { @MainActor [weak self] in
+        guard let self, let frame = self.panel?.frame else { return }
+        var updated = self.settings
+        updated.panelOriginX = frame.origin.x
+        updated.panelOriginY = frame.origin.y
+        updated.panelWidth = frame.width
+        updated.panelHeight = frame.height
+        self.apply(updated)
+    }
 }
 ```
+
+panel은 MainActor Task 안에서만 읽는다. 이동뿐 아니라 `NSWindow.didResizeNotification`도
+같은 처리로 구독하고 observer token을 보관했다가 종료 시 해제한다.
+패널을 크기 조절 가능하게 만들고 Task 7의 초기 크기에 더해 `restorePanelFrame`으로 복원한다.
+width/height가 유한한지 검사하고 최소 560×188부터 현재 화면 visibleFrame까지 제한한다.
+화면이 최소 크기보다 작으면 보이는 영역을 우선한다. 위치도 연결된 화면 안으로 보정한다.
+폰트 40pt에서 내용이 잘리지 않는 최소 높이를 계산한다. 복원 후 알림을 구독해 초기값 덮어쓰기를 막는다.
 
 - [ ] **Step 4: 자막 유지 시간을 설정에서 읽도록 수정**
 
@@ -1980,8 +1953,13 @@ NotificationCenter.default.addObserver(
 Run: `./run.sh`
 1. 메뉴바 "자막" → 설정 → 글자 크기를 바꾼다 → 자막에 **즉시** 반영되는지.
 2. 창을 드래그해 옮긴다.
-3. 종료 후 재실행 → **창 위치·글자 크기·오디오 소스가 유지되는지.**
-4. 인식 언어를 "English" 로 고정 → 한국어를 말해도 영어로 인식하려 하는지.
+3. 종료 후 재실행 → **창 위치·크기·글자 크기·오디오 소스·언어·민감도·기본 대상이 유지되는지.**
+4. 실행 중 고정 언어·감지 민감도·소스를 각각 바꿔 실제 새 configuration이 적용되는지.
+5. 설정 창과 오버레이 소스 버튼 양쪽에서 변경해도 UI가 일치하고 변경당 재구성이 한 번인지.
+6. 3개 언어에서 기본 대상/동일 언어 대체/미지원 비활성화가 맞는지. 디스플레이를 분리해도 창이 보이는지.
+
+가짜 controller를 사용한 SettingsApplyTests도 추가한다. 이전 값과 새 값의 비교, 소스/언어/민감도 변경 시
+재구성 1회, 폰트만 변경 시 재구성 0회, 중지 중 설정 변경 후 다음 시작, 초기 복원을 검증한다.
 
 - [ ] **Step 6: 커밋**
 
@@ -2024,6 +2002,7 @@ Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>"
 `Tests/CaptionsCoreTests/KeychainStoreTests.swift`:
 ```swift
 import Testing
+import Foundation
 @testable import CaptionsCore
 
 @Test func 저장하고_읽고_지운다() {
@@ -2063,7 +2042,10 @@ public enum KeychainStore {
     @discardableResult
     public static func save(_ value: String, account: String) -> Bool {
         guard let data = value.data(using: .utf8) else { return false }
-        SecItemDelete(query(account) as CFDictionary)
+        let status = SecItemUpdate(query(account) as CFDictionary,
+                                   [kSecValueData as String: data] as CFDictionary)
+        if status == errSecSuccess { return true }
+        guard status == errSecItemNotFound else { return false }
         var attributes = query(account)
         attributes[kSecValueData as String] = data
         return SecItemAdd(attributes as CFDictionary, nil) == errSecSuccess
@@ -2156,12 +2138,41 @@ public struct ClaudeRefiner: TranslationRefiner {
 ```swift
 if settings.refinementEnabled {
     SecureField("Anthropic API 키", text: $apiKey)
-        .onSubmit { KeychainStore.save(apiKey, account: KeychainStore.apiKeyAccount) }
+        .onSubmit { saveAPIKey() }
+    Button("키 저장", action: saveAPIKey)
+    Text(keySaveStatus)
+        .font(.caption).foregroundStyle(.secondary)
     Text("키는 Keychain 에 저장됩니다.")
         .font(.caption).foregroundStyle(.secondary)
 }
 ```
 `@State private var apiKey = KeychainStore.read(account: KeychainStore.apiKeyAccount) ?? ""` 를 추가한다.
+아래 상태와 콜백도 `SettingsView`에 추가한다. 저장 성공 후에만 보정기를 갱신한다.
+
+```swift
+@State private var keySaveStatus = ""
+var onAPIKeySaved: () -> Void
+
+private func saveAPIKey() {
+    let value = apiKey.trimmingCharacters(in: .whitespacesAndNewlines)
+    guard !value.isEmpty else {
+        keySaveStatus = "API 키를 입력하세요"
+        return
+    }
+    guard KeychainStore.save(value, account: KeychainStore.apiKeyAccount) else {
+        keySaveStatus = "키를 저장하지 못했습니다"
+        return
+    }
+    keySaveStatus = "키를 저장했습니다"
+    onAPIKeySaved()
+}
+```
+
+`AppDelegate.showSettings()`의 생성자에
+`onAPIKeySaved: { [weak self] in self?.updateRefiner() }`를 전달한다.
+Step 2의 Keychain 구현은 갱신에 `SecItemUpdate`를 사용하고,
+`errSecItemNotFound`일 때만 `SecItemAdd`를 호출한다.
+실패 시 기존 키를 보존한다. 키 내용을 로그·오류 문구에 포함하지 않는다.
 
 - [ ] **Step 5: `AppDelegate` 에서 보정기 연결**
 
@@ -2176,7 +2187,9 @@ private func updateRefiner() {
     translator.refiner = ClaudeRefiner(apiKey: key, model: refinerModel)
 }
 ```
-`apply(_:)` 끝과 `applicationDidFinishLaunching` 에서 호출한다.
+`applicationDidFinishLaunching`, `apply(_:)`의 보정 on/off 변경 분기, API 키 저장 성공 시 호출한다.
+폰트·창 위치만 바뀌었을 때는 다시 연결하지 않는다. `Translator.refiner`의 didSet이
+이전 보정 작업을 취소하고 응답 세대를 무효화한다.
 `refinerModel` 은 Step 0 에서 확인한 모델 ID 상수다.
 
 - [ ] **Step 6: 수동 스모크**
@@ -2184,6 +2197,8 @@ private func updateRefiner() {
 1. 설정에서 보정을 **끈 채로** 실행 → 자막·번역이 정상 동작하는지. **이게 기본 경로다.**
 2. Wi-Fi 를 끈 상태로 보정을 켠다 → 보정만 실패하고 **자막은 계속 나와야 한다.**
 3. 유효한 키를 넣고 보정을 켠다 → 확정 문장에서 번역이 한 번 교체되며 크로스페이드되는지.
+   추가: 먼저 보정을 켠 뒤 처음 키를 저장해도 재토글·재실행 없이 다음 final에 적용되는지.
+   요청 대기 중 보정을 끄거나 키를 교체해도 이전 응답이 표시되지 않는지.
 4. **말하는 도중 번역이 깜빡이지 않는지.** 깜빡이면 스펙 §9 리스크 3 대로 이 태스크를 되돌린다:
    `git revert` 후 `refinementEnabled` 를 설정에서 제거한다.
 
@@ -2242,30 +2257,45 @@ Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>"
 | §9 리스크 5 (번들 조립) | Task 1 Step 8 |
 | §10 0단계 (CLAUDE.md·보드) | Task 1 Step 11·12 |
 
-누락 없음.
+최초 자체 검토의 '누락 없음' 판정은 철회한다. 검토 수정으로 대상 언어 설정·미지원 조합·
+창 크기 영속을 추가했고, 각 항목의 완료 여부는 아래 실행 검증으로 판단한다.
 
-**2. 플레이스홀더** — "TBD"·"적절히 처리"·"위 내용에 대한 테스트" 없음. 모든 코드 단계에 실제 코드가 있다.
+**2. 코드 예시의 범위** — 순수 로직·번역·설정에는 구체적인 코드 예시가 있다.
+Task 5의 변환·제어 흐름과 Task 8의 캡처 시작은 경합이 있던 예시를 제거하고 구현 계약으로 교체했다.
+이 부분은 계약에 맞춘 구현과 회귀 테스트가 남아 있으며 '그대로 복사하면 완성'이라고 주장하지 않는다.
 
-**3. 테스트 누적 개수** — 각 태스크의 기대 개수가 맞는지 대조했다.
+**3. 테스트 범위** — 고정된 누적 개수 대신 아래 필수 범위를 검증하고 실제 실행 개수를 기록한다.
 
-| 태스크 | 추가 | 누적 |
-|---|---|---|
-| Task 1 스모크 | 1 | 1 |
-| Task 2 언어 테이블 | 7 | 8 |
-| Task 3 문자열·설정·디바운서 | 12 | 20 |
-| Task 5 Transcript | 2 | 22 |
-| Task 6 Translator | 5 | 27 |
-| Task 10 Keychain | 1 | 28 |
+| 태스크 | 필수 검증 |
+|---|---|
+| Task 1 | SPM 빌드·테스트 하네스, 타깃별 Swift 모드 |
+| Task 2·3 | 문자열 분류, 3언어 대상 선택, 설정 호환·크기 복원 |
+| Task 5 | PCM 변환, 실행 취소·오류 정리·이전 이벤트 폐기, 발화 ID |
+| Task 6 | final 한정 보정, 응답 역전·취소 무시·세대 무효화 |
+| Task 7 | 실행 타깃 Swift 6 빌드, 실제 언어팩 다운로드 UI |
+| Task 8 | 첫 버퍼 선도착·무음·시작 실패·취소·재시작 |
+| Task 9 | 설정 변경 전후 비교, 실제 적용, 미지원 조합·창 크기 복원 |
+| Task 10 | Keychain 보존 갱신, 키 저장 즉시 연결, 보정 해제 후 응답 폐기 |
 
 **4. 타입 일관성** — 태스크 간 사용 이름을 대조했다.
 `CaptionLanguage.id`(Task 2) → Task 3 `LanguageMode.fixed(String)`, Task 9 Picker tag 에서 동일하게 사용.
-`AudioSource.start` 가 `AVAudioFormat` 을 반환(Task 4) → Task 5 `prepareToAnalyze(in:)`, Task 8 `SystemAudioSource` 에서 동일.
+`AudioSource.start`는 캡처 포맷 반환, `stop`은 async(Task 4·8). Task 5는 변환된 분석 포맷으로 prepare한다.
 `Transcript`(Task 5) → Task 6 `Translator.handle` 이 동일 타입 수신.
 `TranslationRefiner.refine(_:source:context:)`(Task 6) → Task 10 `ClaudeRefiner` 가 동일 시그니처 구현.
 `Settings.refinementEnabled`(Task 3) → Task 9 Toggle, Task 10 `updateRefiner()` 에서 동일.
-불일치 없음.
+문서 정합 검토와 실제 Swift 빌드는 별개다. 전체 예시 통합은 각 태스크의 빌드 게이트에서 확인한다.
 
 **5. 검토 중 고친 결함 1건** — Task 6 의 초안은 `Translator` 가 `TranslationSession` 을
 직접 만들어 쓰게 되어 있었다. 그러면 테스트가 **이 머신의 언어팩 설치 상태에 따라
 통과하기도 실패하기도 한다.** 번역을 `TranslateFunction` 으로 주입 가능하게 바꾸고
 테스트는 가짜를 넣도록 고쳤다. 앱 경로는 기본값 `Translator.onDevice` 를 그대로 쓴다.
+
+**6. 이번 문서 수정에서 실행한 검증 (2026-09-16)**
+
+- `git diff --check`, 코드 펜스 짝, Task 1–10 순서 검사 통과.
+- 문서에서 `LanguageTable`, `Settings`, `Transcript`, `Translator` 예시를 추출해
+  `swiftc -typecheck -swift-version 6` 통과.
+- 같은 예시를 가짜 번역기와 함께 컴파일·실행해 응답 역전 시 이전 결과 폐기,
+  reset 후 취소를 무시한 응답 폐기, 3개 언어의 기본 대상 선택·대체 동작 확인.
+- 앱 전체 구현·마이크/시스템 캡처·언어팩 UI·설정 창 통합은 실행하지 않았다.
+  이 검증은 해당 예시에 한정되며 각 태스크의 구현 완료 체크를 대신하지 않는다.
