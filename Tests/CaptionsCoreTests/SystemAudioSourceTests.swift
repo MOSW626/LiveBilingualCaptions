@@ -207,18 +207,18 @@ private func makeSource(
     while backend.startCount == 0 { await Task.yield() }
     await Task.yield()
 
-    // 버퍼가 오는 바로 그 순간 정지도 걸린다. 버퍼 콜백이 stop()보다 먼저 gate를 채웠을
-    // 수도 있다 — 그러면 start()는 성공하고, 곧바로 stop()이 그 실행을 정지시킨다.
-    // 어느 쪽이든 중복 재개나 충돌 없이 한쪽으로 정확히 끝나야 한다.
+    // 이 하네스에서 결과는 경합이 아니라 정해진 순서다: emit()은 동기 호출이라 stop()보다
+    // 먼저, 같은 MainActor 구간에서 끝난다 — gate는 그 버퍼로 성공 완료되고 sink도 불린다.
+    // 그다음 stop()이 실행 토큰(runGate)을 먼저 비우므로, start()가 gate.wait() 뒤에 하는
+    // "여전히 내 실행인가" 재확인이 실패해 CancellationError로 끝난다. stop()이 이미
+    // stopCapture()까지 마쳤으므로 start()의 실패 경로는 그걸 다시 부르지 않는다
+    // (stopIfStillOwned) — 중복 호출이면 이 테스트가 stopCount == 1에서 잡아낸다.
     backend.emit(sine(micFormat48kStereo, frames: 4800))
     await source.stop()
 
-    do {
-        _ = try await startTask.value
-    } catch {
-        #expect(error is CancellationError)
-    }
-    #expect(backend.stopCount >= 1)
+    await #expect(throws: CancellationError.self) { try await startTask.value }
+    #expect(received.wrapped == 1)
+    #expect(backend.stopCount == 1)
 }
 
 // MARK: - C. 재시작과 옛 콜백

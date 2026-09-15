@@ -176,10 +176,12 @@ public final class SystemAudioSource: AudioSource {
 
 /// 실제 `SCStream` 캡처. 화면 기록 권한과 디스플레이가 필요해서 테스트는 이 타입을
 /// 만들지 않는다 — `SystemAudioSourceTests`는 `SystemCaptureBackend` 가짜로 돈다.
-public final class SCStreamCaptureBackend: NSObject, SystemCaptureBackend, SCStreamOutput, SCStreamDelegate, @unchecked Sendable {
+@MainActor
+public final class SCStreamCaptureBackend: NSObject, SystemCaptureBackend, SCStreamOutput, SCStreamDelegate {
     // sink/onError는 MainActor(startCapture/stopCapture)와 sample queue(SCStreamOutput
-    // 콜백)가 같이 만진다. Mutex 하나로 그 상태만 지키고, 클래스 전체는 SCStreamOutput/
-    // SCStreamDelegate가 nonisolated 콜백이라 필요한 @unchecked Sendable이다.
+    // 콜백이 nonisolated로 도는 곳)가 같이 만진다. Mutex 하나로 그 상태만 지킨다. 클래스
+    // 자체는 SystemCaptureBackend 준수로 이미 @MainActor라 @unchecked Sendable이 필요
+    // 없다 — nonisolated 델리게이트 메서드 둘만 그 격리를 벗어난다.
     private struct State {
         var sink: (@Sendable (AVAudioPCMBuffer) -> Void)?
         var onError: (@Sendable (any Error) -> Void)?
