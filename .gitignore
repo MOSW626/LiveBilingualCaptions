@@ -3,3 +3,4 @@ dist/
 *.xcuserstate
 .swiftpm/
 .build/
+.claude/settings.local.json
