@@ -12,11 +12,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var settings = Settings.default
     private var running = false
     private var clearTask: Task<Void, Never>?
-    /// 발화 ID는 파이프라인이 매기는 Int(`TranscriptEvent.utteranceID`)이지만 Translator는
-    /// 자막 목록을 염두에 두고 UUID를 쓴다. 여기서 Int → UUID로 다리를 놓는다.
-    /// 같은 utteranceID가 이어지는 동안(부분 → 확정 갱신)은 같은 UUID를 유지한다.
-    private var currentUtteranceID: Int?
-    private var currentCaptionID = UUID()
     /// 자동 모드는 실험 기능이다. 최초 언어는 한국어, 고정 모드는 저장한 ID를 쓴다.
     private var languageMode: LanguageMode = .fixed(CaptionLanguage.korean.id) {
         didSet { syncLanguage() }
@@ -27,7 +22,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var sensitivity: DetectorSensitivity = .medium
     private var audioSourceKind: AudioSourceKind = .microphone
     private var captionHoldSeconds: Double = 10
-    private var latestCaption = LatestCaption()
 
     /// 설정에서 만든 소스·언어·민감도의 스냅샷. 모든 시작/재구성이 이 경로를 지난다.
     private var currentConfiguration: PipelineConfiguration {
@@ -50,17 +44,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         translator.onTranslation = { [weak self] text, _, captionID in
             self?.state.setTranslation(text, for: captionID)
         }
-    }
-
-    /// 파이프라인의 Int `utteranceID`를 Translator의 UUID `captionID`로 바꾼다.
-    /// 같은 발화(같은 utteranceID)가 이어지는 동안에는 같은 UUID를 유지해서
-    /// 부분→확정 갱신이 같은 줄로 취급되게 한다. 발화가 바뀌면 새 UUID를 발급한다.
-    private func captionID(for utteranceID: Int) -> UUID {
-        if utteranceID != currentUtteranceID {
-            currentUtteranceID = utteranceID
-            currentCaptionID = UUID()
-        }
-        return currentCaptionID
     }
 
     /// 저장된 설정에서 언어·소스·민감도를 읽어 온다. 고정 모드의 ID가 곧 시작 언어이고,
@@ -138,18 +121,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     private func show(_ event: TranscriptEvent) {
-        // 옛 발화의 뒤늦은 final이 최신 원문을 되돌리지 않게 발화 ID로 거른다.
-        guard let text = latestCaption.apply(event) else { return }
-        let captionID = captionID(for: event.utteranceID)
-        // 새 발화라고 화면을 비우지 않는다 — 이전 발화가 위에 남아야 읽을 시간이 생긴다.
-        state.upsert(id: captionID, original: CaptionText.tail(text),
-                     isFinal: event.isFinal, sourceLanguageID: event.sourceLanguage.id)
+        // 목록 규칙(추가 vs 갱신, 옛 줄 찾아가기, 트리밍)은 전부 CaptionState 에 있다.
+        // 여기는 글루다 — 화면을 비우는 판단이 이 경로에 끼어들 자리가 없다.
+        // nil 은 이미 밀려난 옛 발화의 갱신이라는 뜻이고, 그러면 번역도 걸지 않는다.
+        guard let captionID = state.apply(event) else { return }
         translator.submit(event.transcript, from: event.sourceLanguage, captionID: captionID)
         // 말이 이어지는 동안에는 지우기 타이머를 계속 뒤로 민다.
         scheduleCaptionClear()
 
         if case .auto = languageMode, event.isFinal {
-            proposeAutomaticLanguage(for: text)
+            proposeAutomaticLanguage(for: event.text)
         }
     }
 
@@ -245,8 +226,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         clearTask?.cancel()
         clearTask = nil
         translator.reset()
-        latestCaption.reset()
-        currentUtteranceID = nil
+        // 장부만 비운다. 화면의 자막은 남긴다 — 정지했다고 읽던 줄을 뺏지 않는다.
+        state.resetLedger()
     }
 
     private func quitApp() {
@@ -301,8 +282,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             guard !Task.isCancelled, let self else { return }
             self.state.clear()
             self.translator.reset() // 유지 시간 만료 — 대기 중이던 번역도 무효화.
-            self.latestCaption.reset()
-            self.currentUtteranceID = nil
             self.clearTask = nil
         }
     }

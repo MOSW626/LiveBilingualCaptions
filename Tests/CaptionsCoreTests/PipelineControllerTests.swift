@@ -885,7 +885,7 @@ let englishConfig = PipelineConfiguration(source: .microphone, language: .englis
     #expect(harness.events.wrapped.allSatisfy { $0.runID == harness.controller.currentGeneration })
 }
 
-@Test @MainActor func 교차_도착한_옛_구간의_final이_최신_원문을_되돌리지_않는다() async {
+@Test @MainActor func 교차_도착한_옛_구간의_final은_옛_줄에_붙고_최신_줄은_그대로다() async {
     let harness = Harness()
     harness.controller.requestStart(configuration: koreanConfig)
     await harness.waitUntilListening()
@@ -904,10 +904,21 @@ let englishConfig = PipelineConfiguration(source: .microphone, language: .englis
     #expect(events[0].utteranceID != events[1].utteranceID)
     #expect(events[2].utteranceID == events[0].utteranceID)  // 옛 구간의 final은 옛 발화에 붙는다
 
-    // 한 줄 라벨은 최신 발화를 잃지 않는다.
+    // 최신 원문은 되돌아가지 않고, 옛 구간의 갱신에는 표시가 붙는다.
     var latest = LatestCaption()
-    for event in events { _ = latest.apply(event) }
+    let updates = events.map { latest.apply($0) }
     #expect(latest.text == "두 번째 문장")
+    #expect(updates.map(\.isOutdated) == [false, false, true])
+
+    // 목록 UI 는 그 뒤늦은 final 을 버리지 않는다 — 사용자가 읽고 있는 게 그 줄이다.
+    // 옛 줄이 확정본으로 갱신되고, 최신 줄은 손대지 않는다.
+    let state = CaptionState()
+    for event in events { _ = state.apply(event) }
+    #expect(state.entries.count == 2)
+    #expect(state.entries[0].original == "첫 문장입니다")
+    #expect(state.entries[0].isFinal)
+    #expect(state.entries[1].original == "두 번째 문장")
+    #expect(!state.entries[1].isFinal)
 }
 
 @Test @MainActor func 언어_전환_뒤의_이벤트는_새_언어를_싣는다() async {

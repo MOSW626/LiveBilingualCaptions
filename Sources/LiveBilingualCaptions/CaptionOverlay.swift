@@ -58,7 +58,12 @@ struct CaptionOverlay: View {
         }
         .padding(.horizontal, 26)
         .padding(.vertical, 18)
+        // 기준 커밋의 NSVisualEffectView(.hudWindow) 는 **어두운** 재질이다. 밝은 재질 위의
+        // 흰 자막은 밝은 배경 앱 위에서 대비를 잃는다 — 이 앱이 하는 유일한 일이 읽히는
+        // 것이므로 밝기를 환경에 맡기지 않고 어둡게 고정한다.
+        .background(.black.opacity(0.5), in: .rect(cornerRadius: 20))
         .background(.ultraThinMaterial, in: .rect(cornerRadius: 20))
+        .environment(\.colorScheme, .dark)
         .onGeometryChange(for: CGFloat.self) { $0.size.height } action: { onHeight($0) }
         // 창이 아직 줄어들기 전이라면 자막은 아래에 붙어 있는다.
         .frame(maxHeight: .infinity, alignment: .bottom)
@@ -75,6 +80,10 @@ struct CaptionOverlay: View {
 
     @MainActor
     private func requestPackIfNeeded() async {
+        // 먼저 비운다. Configuration 은 Equatable 이라, 팩이 필요한 언어쌍으로 되돌아왔을 때
+        // 값이 같은 설정을 다시 넣으면 SwiftUI 가 변화를 못 보고 시트를 띄우지 않는다.
+        // 이 nil 은 아래 await 를 건너 관측되고, .installed 로 밝혀진 쌍도 이 줄이 정리한다.
+        downloadConfiguration = nil
         // .installed 면 할 일이 없고, .unsupported 면 시트를 띄워도 받을 게 없다.
         guard await Translator.packStatus(from: state.sourceLanguage,
                                           to: state.targetLanguage) == .needsDownload else { return }

@@ -123,23 +123,40 @@ public struct UtteranceLedger: Sendable {
     }
 }
 
-/// 한 줄만 보여주는 UI가 최신 발화를 잃지 않게 한다.
+/// 최신 발화가 무엇인지를 기억한다.
 ///
 /// 확정 구간의 final과 그 뒤 구간의 volatile은 순서를 바꿔 도착할 수 있다. 발화 ID로
-/// 거르지 않으면 옛 구간의 final이 최신 원문을 되돌려버린다. 여러 줄을 쌓는 UI는
-/// Task 7의 몫이고, 그때까지 한 줄 라벨이 쓰는 최소한의 규칙이다.
+/// 구분하지 않으면 옛 구간의 final이 최신 원문을 되돌려버린다.
+///
+/// 여러 줄을 쌓는 UI(`CaptionState`)에서는 옛 구간의 뒤늦은 final도 **버릴 게 아니라
+/// 자기 줄에 반영**해야 한다 — 사용자가 읽고 있는 게 바로 그 줄이다. 그래서 무시하라고
+/// nil을 돌려주는 대신 "최신이 아니다"라는 표시를 붙여 돌려준다. 판단은 호출자 몫이고,
+/// 여기서 지키는 건 `text`/`shownID`가 절대 되돌아가지 않는다는 것 하나다.
 public struct LatestCaption: Sendable {
+    public struct Update: Sendable, Equatable {
+        public let text: String
+        /// true면 최신 발화가 아니다 — 목록의 옛 줄에 반영해야 한다.
+        public let isOutdated: Bool
+
+        public init(text: String, isOutdated: Bool) {
+            self.text = text
+            self.isOutdated = isOutdated
+        }
+    }
+
     public private(set) var text = ""
     private var shownID = 0
 
     public init() {}
 
-    /// 화면을 갱신해야 하면 새 문자열을, 무시해야 하면 nil을 돌려준다.
-    public mutating func apply(_ event: TranscriptEvent) -> String? {
-        guard event.utteranceID >= shownID else { return nil }
+    public mutating func apply(_ event: TranscriptEvent) -> Update {
+        // 옛 구간의 뒤늦은 갱신. 최신 원문은 건드리지 않고 표시만 붙여 넘긴다.
+        guard event.utteranceID >= shownID else {
+            return Update(text: event.text, isOutdated: true)
+        }
         shownID = event.utteranceID
         text = event.text
-        return text
+        return Update(text: text, isOutdated: false)
     }
 
     public mutating func reset() {
