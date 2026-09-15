@@ -1,7 +1,8 @@
 import AppKit
 import AVFoundation
-import Speech
+import CaptionsCore
 
+@MainActor
 final class AppDelegate: NSObject, NSApplicationDelegate {
     private var panel: NSPanel!
     private let originalLabel = NSTextField(labelWithString: "말을 시작하면 원문이 여기에 표시됩니다")
@@ -11,32 +12,116 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private let clearButton = NSButton(title: "지우기", target: nil, action: nil)
     private let quitButton = NSButton(title: "종료", target: nil, action: nil)
     private let languageButton = NSButton(title: "자동", target: nil, action: nil)
-    private let audioEngine = AVAudioEngine()
-    private var analyzer: SpeechAnalyzer?
-    private var transcriber: DictationTranscriber?
-    private var inputContinuation: AsyncStream<AnalyzerInput>.Continuation?
-    private var analysisTask: Task<Void, Never>?
-    private var resultsTask: Task<Void, Never>?
-    private var legacyRecognizer: SFSpeechRecognizer?
-    private var legacyRequest: SFSpeechAudioBufferRecognitionRequest?
-    private var legacyTask: SFSpeechRecognitionTask?
+    private let controller = PipelineController(pipeline: SpeechPipeline())
     private var running = false
     private var translateWork: DispatchWorkItem?
     private var pendingTranslationText = ""
     private var lastTranslationStartedAt = Date.distantPast
     private var clearWork: DispatchWorkItem?
     private var lastTranslatedSource = ""
-    private var recognitionLocaleIdentifier = "ko-KR"
-    private var languageMode = "auto"
-    private var latestRecognizedText = ""
-    private var latestRecognitionConfidence: Float = 0
-    private var lastVoiceAt = Date.distantPast
-    private var speechActive = false
-    private var silenceTimer: Timer?
+    /// 자동 모드는 실험 기능이다. 최초 언어는 한국어, 고정 모드는 저장한 ID를 쓴다.
+    private var languageMode: LanguageMode = .fixed(CaptionLanguage.korean.id)
+    private var currentLanguage: CaptionLanguage = .korean
+    private var sensitivity: DetectorSensitivity = .medium
+    private var audioSourceKind: AudioSourceKind = .microphone
+    private var captionHoldSeconds: Double = 10
+    private var latestCaption = LatestCaption()
+
+    /// 설정에서 만든 소스·언어·민감도의 스냅샷. 모든 시작/재구성이 이 경로를 지난다.
+    private var currentConfiguration: PipelineConfiguration {
+        PipelineConfiguration(source: audioSourceKind, language: currentLanguage, sensitivity: sensitivity)
+    }
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         buildWindow()
+        bindController()
         requestPermissionsAndStart()
+    }
+
+    private func bindController() {
+        applyStoredSettings()
+        controller.onState = { [weak self] state in self?.apply(state) }
+        controller.onEvent = { [weak self] event in self?.handle(event) }
+    }
+
+    /// 저장된 설정에서 언어·소스·민감도를 읽어 온다. 고정 모드의 ID가 곧 시작 언어이고,
+    /// 자동 모드의 최초 언어는 한국어다.
+    private func applyStoredSettings() {
+        let settings = Settings.load(from: .standard)
+        languageMode = settings.languageMode
+        audioSourceKind = settings.audioSource
+        sensitivity = settings.detectorSensitivity
+        captionHoldSeconds = settings.captionHoldSeconds
+        if case .fixed(let id) = settings.languageMode,
+           let language = LanguageTable.default.language(id: id) {
+            currentLanguage = language
+        } else {
+            currentLanguage = .korean
+        }
+        languageButton.title = languageButtonTitle
+    }
+
+    /// running과 버튼 상태는 controller의 상태 하나에서 함께 갱신한다.
+    /// 시작 요청을 보냈다고 곧바로 "듣는 중"으로 바꾸지 않는다.
+    private func apply(_ state: PipelineController.State) {
+        switch state {
+        case .stopped:
+            running = false
+            toggleButton.title = "시작"
+            statusLabel.stringValue = "일시 정지"
+        case .starting:
+            running = true
+            toggleButton.title = "정지"
+            statusLabel.stringValue = "음성 엔진 시작 중…"
+        case .listening:
+            running = true
+            toggleButton.title = "정지"
+            updateListeningStatus()
+        case .stopping:
+            toggleButton.title = "정지 중…"
+        case .failed(let message):
+            running = false
+            toggleButton.title = "다시 시작"
+            statusLabel.stringValue = "시작 실패: \(message)"
+        }
+        toggleButton.isEnabled = true
+    }
+
+    private func handle(_ event: PipelineEvent) {
+        switch event.kind {
+        case .installing(let fraction):
+            let percent = max(0, min(100, Int(fraction * 100)))
+            statusLabel.stringValue = "음성 모델 설치 중 · \(percent)%"
+        case .listening(let language):
+            currentLanguage = language
+            updateListeningStatus()
+        case .transcript(let transcript):
+            show(transcript)
+        case .failed:
+            break // 상태 콜백이 메시지를 이미 보여준다
+        }
+    }
+
+    private func show(_ event: TranscriptEvent) {
+        // 옛 발화의 뒤늦은 final이 최신 원문을 되돌리지 않게 발화 ID로 거른다.
+        guard let text = latestCaption.apply(event) else { return }
+        let displayed = CaptionText.tail(text)
+        originalLabel.stringValue = displayed
+        scheduleTranslation(of: event.transcript)
+        // 말이 이어지는 동안에는 지우기 타이머를 계속 뒤로 민다.
+        scheduleCaptionClear()
+
+        if case .auto = languageMode, event.isFinal {
+            proposeAutomaticLanguage(for: text)
+        }
+    }
+
+    /// 자동 전환은 실험 기능이다. 제안만 하고 실행은 반드시 controller를 거친다.
+    private func proposeAutomaticLanguage(for text: String) {
+        let detected = LanguageTable.default.detect(text, current: currentLanguage)
+        guard detected != currentLanguage else { return }
+        currentLanguage = detected
+        controller.requestReconfigure(configuration: currentConfiguration)
     }
 
     private func buildWindow() {
@@ -137,16 +222,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     private func requestPermissionsAndStart() {
-        SFSpeechRecognizer.requestAuthorization { [weak self] auth in
-            AVCaptureDevice.requestAccess(for: .audio) { mic in
-                DispatchQueue.main.async {
-                    guard auth == .authorized, mic else {
-                        self?.statusLabel.stringValue = "마이크와 음성 인식 권한이 필요합니다"
-                        self?.toggleButton.isEnabled = false
-                        return
-                    }
-                    self?.startListening()
+        AVCaptureDevice.requestAccess(for: .audio) { [weak self] granted in
+            DispatchQueue.main.async {
+                guard granted else {
+                    self?.statusLabel.stringValue = "마이크 권한이 필요합니다"
+                    self?.toggleButton.isEnabled = false
+                    return
                 }
+                self?.startListening()
             }
         }
     }
@@ -158,8 +241,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     @objc private func clearCaptions() {
         originalLabel.stringValue = ""
         translatedLabel.stringValue = ""
+        invalidateCaptions()
+    }
+
+    /// 진행 중인 번역 작업과 clear 타이머를 취소한다.
+    /// Task 6에서 여기에 translator.reset()과 번역 세대 무효화가 붙는다.
+    private func invalidateCaptions() {
         clearWork?.cancel()
+        clearWork = nil
+        translateWork?.cancel()
+        translateWork = nil
+        pendingTranslationText = ""
         lastTranslatedSource = ""
+        latestCaption.reset()
     }
 
     @objc private func quitApp() {
@@ -167,255 +261,53 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         NSApp.terminate(nil)
     }
 
+    /// 수동 한국어/영어 전환과 설정의 fixed ID가 같은 configuration 경로를 탄다.
     @objc private func switchLanguage() {
-        if languageMode == "auto" {
-            languageMode = "ko"
-            recognitionLocaleIdentifier = "ko-KR"
-            languageButton.title = "한국어"
-        } else if languageMode == "ko" {
-            languageMode = "en"
-            recognitionLocaleIdentifier = "en-US"
-            languageButton.title = "English"
-        } else {
-            languageMode = "auto"
-            recognitionLocaleIdentifier = "ko-KR"
-            languageButton.title = "자동"
+        switch languageMode {
+        case .auto:
+            languageMode = .fixed(CaptionLanguage.korean.id)
+            currentLanguage = .korean
+        case .fixed(let id) where id == CaptionLanguage.korean.id:
+            languageMode = .fixed(CaptionLanguage.english.id)
+            currentLanguage = .english
+        case .fixed:
+            languageMode = .auto
+            currentLanguage = .korean
         }
-        clearCaptions()
+        languageButton.title = languageButtonTitle
         if running {
-            stopListening()
-            startListening()
+            controller.requestReconfigure(configuration: currentConfiguration)
+        }
+    }
+
+    private var languageButtonTitle: String {
+        switch languageMode {
+        case .auto: "자동 (실험)"
+        case .fixed(let id): LanguageTable.default.language(id: id)?.displayName ?? id
         }
     }
 
     private func startListening() {
-        guard !running else { return }
-        running = true
-        toggleButton.title = "정지"
-        statusLabel.stringValue = "기존 음성 엔진 시작 중…"
-        startLegacyTranscription()
-    }
-
-    private func startLegacyTranscription() {
-        do {
-            let recognizer = SFSpeechRecognizer(locale: Locale(identifier: recognitionLocaleIdentifier))
-            guard let recognizer, recognizer.isAvailable else {
-                throw NSError(domain: "Captions", code: 10, userInfo: [NSLocalizedDescriptionKey: "macOS 음성 인식 서비스를 사용할 수 없습니다"])
-            }
-            legacyRecognizer = recognizer
-            beginLegacyRecognitionTask()
-
-            let input = audioEngine.inputNode
-            let format = input.outputFormat(forBus: 0)
-            guard format.sampleRate > 0 else {
-                throw NSError(domain: "Captions", code: 11, userInfo: [NSLocalizedDescriptionKey: "마이크 입력을 찾지 못했습니다"])
-            }
-            input.removeTap(onBus: 0)
-            input.installTap(onBus: 0, bufferSize: 2048, format: format) { [weak self] buffer, _ in
-                self?.legacyRequest?.append(buffer)
-                guard let channel = buffer.floatChannelData?[0] else { return }
-                let count = Int(buffer.frameLength)
-                guard count > 0 else { return }
-                var sum: Float = 0
-                for index in stride(from: 0, to: count, by: 4) { sum += channel[index] * channel[index] }
-                let rms = sqrt(sum / Float(max(1, count / 4)))
-                if rms > 0.0035 {
-                    DispatchQueue.main.async { self?.voiceDetected() }
-                }
-            }
-            audioEngine.prepare()
-            try audioEngine.start()
-            updateListeningStatus()
-            silenceTimer?.invalidate()
-            silenceTimer = Timer.scheduledTimer(withTimeInterval: 0.25, repeats: true) { [weak self] _ in
-                self?.checkForSilence()
-            }
-        } catch {
-            statusLabel.stringValue = "시작 실패: \(error.localizedDescription)"
-            running = false
-            toggleButton.title = "다시 시작"
-        }
-    }
-
-    private func beginLegacyRecognitionTask() {
-        guard let recognizer = legacyRecognizer else { return }
-        let request = SFSpeechAudioBufferRecognitionRequest()
-        request.shouldReportPartialResults = true
-        request.addsPunctuation = true
-        request.taskHint = .dictation
-        request.contextualStrings = ["English", "Korean", "PowerPoint", "presentation", "individual", "team"]
-        legacyRequest = request
-        legacyTask = recognizer.recognitionTask(with: request) { [weak self] result, error in
-            DispatchQueue.main.async {
-                if let result {
-                    let text = result.bestTranscription.formattedString.trimmingCharacters(in: .whitespacesAndNewlines)
-                    if !text.isEmpty {
-                        self?.latestRecognizedText = text
-                        let displayedText = self?.captionTail(text) ?? text
-                        self?.originalLabel.stringValue = displayedText
-                        let segments = result.bestTranscription.segments
-                        self?.latestRecognitionConfidence = segments.isEmpty ? 0 : segments.map(\.confidence).reduce(0, +) / Float(segments.count)
-                        self?.scheduleTranslation(of: displayedText)
-                    }
-                }
-                if let error, self?.running == true {
-                    self?.statusLabel.stringValue = "인식 오류: \(error.localizedDescription)"
-                }
-            }
-        }
-    }
-
-    private func voiceDetected() {
-        lastVoiceAt = Date()
-        if !speechActive {
-            speechActive = true
-            clearWork?.cancel()
-            originalLabel.stringValue = ""
-            translatedLabel.stringValue = ""
-            lastTranslatedSource = ""
-            latestRecognizedText = ""
-            latestRecognitionConfidence = 0
-        }
-    }
-
-    private func checkForSilence() {
-        guard running, speechActive, Date().timeIntervalSince(lastVoiceAt) > 1.15 else { return }
-        speechActive = false
-        legacyRequest?.endAudio()
-        legacyTask?.finish()
-        scheduleCaptionClear()
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.2) { [weak self] in
-            guard self?.running == true else { return }
-            self?.adaptLanguageForNextUtterance()
-            self?.beginLegacyRecognitionTask()
-        }
-    }
-
-    private func adaptLanguageForNextUtterance() {
-        guard languageMode == "auto" else { return }
-        let scalars = latestRecognizedText.unicodeScalars
-        let hangulCount = scalars.filter { (0xAC00...0xD7A3).contains(Int($0.value)) }.count
-        let latinCount = scalars.filter {
-            (0x41...0x5A).contains(Int($0.value)) || (0x61...0x7A).contains(Int($0.value))
-        }.count
-        let nextLocale: String
-        if hangulCount > 0 {
-            nextLocale = "ko-KR"
-        } else if latinCount >= 3 {
-            nextLocale = recognitionLocaleIdentifier == "en-US" && latestRecognitionConfidence < 0.28 ? "ko-KR" : "en-US"
-        } else {
-            nextLocale = recognitionLocaleIdentifier == "en-US" ? "ko-KR" : recognitionLocaleIdentifier
-        }
-        if nextLocale != recognitionLocaleIdentifier {
-            recognitionLocaleIdentifier = nextLocale
-            legacyRecognizer = SFSpeechRecognizer(locale: Locale(identifier: nextLocale))
-        }
-        updateListeningStatus()
-    }
-
-    private func updateListeningStatus() {
-        let active = recognitionLocaleIdentifier == "ko-KR" ? "KO" : "EN"
-        let mode = languageMode == "auto" ? "자동 \(active)" : (active == "KO" ? "한국어" : "English")
-        statusLabel.stringValue = "● 듣는 중 · \(mode) · 회의 모드"
-    }
-
-    @available(macOS 26.0, *)
-    private func startModernTranscription() async {
-        do {
-            guard let locale = await DictationTranscriber.supportedLocale(equivalentTo: Locale(identifier: "ko-KR")) else {
-                throw NSError(domain: "Captions", code: 2, userInfo: [NSLocalizedDescriptionKey: "한국어 전사 모델을 지원하지 않습니다"])
-            }
-            let transcriber = DictationTranscriber(
-                locale: locale,
-                contentHints: [.farField],
-                transcriptionOptions: [.punctuation],
-                reportingOptions: [.volatileResults, .frequentFinalization],
-                attributeOptions: []
-            )
-            if let install = try await AssetInventory.assetInstallationRequest(supporting: [transcriber]) {
-                let progress = install.progress
-                let progressTask = Task { [weak self] in
-                    while !Task.isCancelled && !progress.isFinished {
-                        let percent = max(0, min(100, Int(progress.fractionCompleted * 100)))
-                        await MainActor.run {
-                            self?.statusLabel.stringValue = "음성 모델 설치 중 · \(percent)%"
-                        }
-                        try? await Task.sleep(for: .milliseconds(400))
-                    }
-                }
-                try await install.downloadAndInstall()
-                progressTask.cancel()
-            }
-            await MainActor.run { self.statusLabel.stringValue = "음성 엔진 시작 중…" }
-            guard let format = await SpeechAnalyzer.bestAvailableAudioFormat(compatibleWith: [transcriber]) else {
-                throw NSError(domain: "Captions", code: 3, userInfo: [NSLocalizedDescriptionKey: "호환되는 마이크 형식을 찾지 못했습니다"])
-            }
-            let (stream, continuation) = AsyncStream.makeStream(of: AnalyzerInput.self)
-            let analyzer = SpeechAnalyzer(modules: [transcriber])
-            try await analyzer.prepareToAnalyze(in: format)
-
-            await MainActor.run {
-                self.transcriber = transcriber
-                self.analyzer = analyzer
-                self.inputContinuation = continuation
-                let input = self.audioEngine.inputNode
-                input.removeTap(onBus: 0)
-                input.installTap(onBus: 0, bufferSize: 4096, format: format) { buffer, _ in
-                    continuation.yield(AnalyzerInput(buffer: buffer))
-                }
-                self.audioEngine.prepare()
-            }
-            try await audioEngine.start()
-            await MainActor.run { self.statusLabel.stringValue = "● 듣는 중 · 한국어 + English 혼용" }
-
-            resultsTask = Task { [weak self] in
-                do {
-                    for try await result in transcriber.results {
-                        let text = String(result.text.characters).trimmingCharacters(in: .whitespacesAndNewlines)
-                        guard !text.isEmpty else { continue }
-                        await MainActor.run {
-                            self?.originalLabel.stringValue = text
-                            self?.scheduleTranslation(of: text)
-                            self?.scheduleCaptionClear()
-                        }
-                    }
-                } catch {
-                    await MainActor.run { self?.statusLabel.stringValue = "전사 오류: \(error.localizedDescription)" }
-                }
-            }
-            analysisTask = Task { [weak self] in
-                do { _ = try await analyzer.analyzeSequence(stream) }
-                catch { await MainActor.run { self?.statusLabel.stringValue = "분석 오류: \(error.localizedDescription)" } }
-            }
-        } catch {
-            await MainActor.run {
-                self.statusLabel.stringValue = "시작 실패: \(error.localizedDescription)"
-                self.running = false
-                self.toggleButton.title = "다시 시작"
-            }
-        }
+        controller.requestStart(configuration: currentConfiguration)
     }
 
     private func stopListening() {
-        if audioEngine.isRunning { audioEngine.stop() }
-        audioEngine.inputNode.removeTap(onBus: 0)
-        legacyRequest?.endAudio()
-        legacyTask?.cancel()
-        legacyRequest = nil; legacyTask = nil; legacyRecognizer = nil
-        silenceTimer?.invalidate(); silenceTimer = nil
-        speechActive = false
-        inputContinuation?.finish()
-        inputContinuation = nil
-        analysisTask?.cancel(); resultsTask?.cancel()
-        analysisTask = nil; resultsTask = nil
-        if let analyzer { Task { await analyzer.cancelAndFinishNow() } }
-        analyzer = nil; transcriber = nil
-        running = false
-        toggleButton.title = "시작"
-        statusLabel.stringValue = "일시 정지"
+        invalidateCaptions()
+        controller.requestStop()
     }
 
-    private func scheduleTranslation(of text: String) {
+    private func updateListeningStatus() {
+        let mode: String
+        switch languageMode {
+        case .auto: mode = "자동 (실험) · \(currentLanguage.displayName)"
+        case .fixed: mode = currentLanguage.displayName
+        }
+        statusLabel.stringValue = "● 듣는 중 · \(mode)"
+    }
+
+    /// Task 6에서 `Transcript`를 그대로 쓰는 구현으로 교체한다. 지금은 문자열만 넘긴다.
+    private func scheduleTranslation(of transcript: Transcript) {
+        let text = transcript.text
         guard text != lastTranslatedSource else { return }
         pendingTranslationText = text
         guard translateWork == nil else { return }
@@ -432,16 +324,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         DispatchQueue.main.asyncAfter(deadline: .now() + delay, execute: work)
     }
 
-    private func captionTail(_ text: String) -> String {
-        let limit = 92
-        guard text.count > limit else { return text }
-        let suffix = String(text.suffix(limit))
-        if let space = suffix.firstIndex(where: { $0 == " " }) {
-            return "…" + suffix[suffix.index(after: space)...]
-        }
-        return "…" + suffix
-    }
-
     private func scheduleCaptionClear() {
         clearWork?.cancel()
         let work = DispatchWorkItem { [weak self] in
@@ -456,10 +338,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 self.originalLabel.alphaValue = 1
                 self.translatedLabel.alphaValue = 1
                 self.lastTranslatedSource = ""
+                self.latestCaption.reset()
             }
         }
         clearWork = work
-        DispatchQueue.main.asyncAfter(deadline: .now() + 10.0, execute: work)
+        // 발화마다 지우지 않는다. 침묵이 captionHoldSeconds 만큼 이어진 뒤에만 비운다.
+        DispatchQueue.main.asyncAfter(deadline: .now() + captionHoldSeconds, execute: work)
     }
 
     private func translate(_ text: String) {
@@ -482,7 +366,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 self?.lastTranslatedSource = text
                 self?.translatedLabel.stringValue = translated
                 if let pending = self?.pendingTranslationText, pending != text {
-                    self?.scheduleTranslation(of: pending)
+                    self?.scheduleTranslation(of: .partial(pending))
                 }
             }
         }.resume()

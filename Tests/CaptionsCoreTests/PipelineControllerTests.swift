@@ -1,0 +1,845 @@
+import AVFoundation
+import Foundation
+import Testing
+@testable import CaptionsCore
+
+// 이 파일의 테스트는 마이크·디스플레이·Speech 모델 없이 돈다.
+// 가짜 소스와 가짜 Speech 세션을 쓰고, 시점은 전부 수동 재개 continuation으로 잡는다.
+// sleep 으로 타이밍을 맞추지 않는다.
+
+// MARK: - 공용 도구
+
+/// MainActor 밖에서 만져지는 가짜의 상태를 지키는 최소 상자.
+final class Locked<Value>: @unchecked Sendable {
+    private let lock = NSLock()
+    private var value: Value
+
+    init(_ value: Value) { self.value = value }
+
+    var wrapped: Value {
+        lock.lock(); defer { lock.unlock() }
+        return value
+    }
+
+    @discardableResult
+    func mutate<R>(_ body: (inout Value) -> R) -> R {
+        lock.lock(); defer { lock.unlock() }
+        return body(&value)
+    }
+}
+
+/// 한 번짜리 신호. 기다리는 쪽이 늦게 와도 놓치지 않는다.
+@MainActor
+final class Signal {
+    private var waiter: CheckedContinuation<Void, Never>?
+    private var pending = false
+
+    func fire() {
+        if let waiter {
+            self.waiter = nil
+            waiter.resume()
+        } else {
+            pending = true
+        }
+    }
+
+    func wait() async {
+        if pending { pending = false; return }
+        await withCheckedContinuation { waiter = $0 }
+    }
+}
+
+enum TestError: LocalizedError {
+    case installFailed
+    case startFailed
+    case reserveFailed
+
+    var errorDescription: String? {
+        switch self {
+        case .installFailed: "모델 설치 실패"
+        case .startFailed: "분석 시작 실패"
+        case .reserveFailed: "예약 실패"
+        }
+    }
+}
+
+nonisolated(unsafe) let analysisFormat = AVAudioFormat(
+    commonFormat: .pcmFormatInt16, sampleRate: 16000, channels: 1, interleaved: true)!
+nonisolated(unsafe) let micFormat48kStereo = AVAudioFormat(
+    commonFormat: .pcmFormatFloat32, sampleRate: 48000, channels: 2, interleaved: false)!
+nonisolated(unsafe) let micFormat44kMono = AVAudioFormat(
+    commonFormat: .pcmFormatFloat32, sampleRate: 44100, channels: 1, interleaved: false)!
+
+func sine(_ format: AVAudioFormat, frames: AVAudioFrameCount, startFrame: Int = 0) -> AVAudioPCMBuffer {
+    let buffer = AVAudioPCMBuffer(pcmFormat: format, frameCapacity: frames)!
+    buffer.frameLength = frames
+    for channel in 0..<Int(format.channelCount) {
+        let data = buffer.floatChannelData![channel]
+        for index in 0..<Int(frames) {
+            let t = Double(startFrame + index) / format.sampleRate
+            data[index] = 0.5 * Float(sin(2 * Double.pi * 220 * t))
+        }
+    }
+    return buffer
+}
+
+func int16Samples(_ buffer: AVAudioPCMBuffer) -> [Int16] {
+    let data = buffer.int16ChannelData![0]
+    return (0..<Int(buffer.frameLength)).map { data[$0] }
+}
+
+// MARK: - 가짜 오디오 소스
+
+@MainActor
+final class FakeAudioSource: AudioSource {
+    let format: AVAudioFormat
+    var startError: (any Error)?
+    /// true면 start가 `release()` 또는 취소 전까지 매달린다.
+    var blocksUntilReleased = false
+
+    let startSuspended = Signal()
+    private(set) var startCount = 0
+    private(set) var stopCount = 0
+    private(set) var sink: (@Sendable (AVAudioPCMBuffer) -> Void)?
+    private var pending: CheckedContinuation<Void, any Error>?
+
+    init(format: AVAudioFormat = micFormat48kStereo) { self.format = format }
+
+    func start(_ sink: @escaping @Sendable (AVAudioPCMBuffer) -> Void) async throws -> AVAudioFormat {
+        startCount += 1
+        self.sink = sink
+        if let startError { throw startError }
+        if blocksUntilReleased {
+            try await withTaskCancellationHandler {
+                try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, any Error>) in
+                    pending = continuation
+                    startSuspended.fire()
+                }
+            } onCancel: {
+                // 취소 핸들러가 대기를 푼다 — worker가 시작 완료만 기다리다 멈추지 않도록.
+                Task { @MainActor in self.release(throwing: CancellationError()) }
+            }
+        }
+        return format
+    }
+
+    func stop() async {
+        stopCount += 1
+        sink = nil
+    }
+
+    func release(throwing error: (any Error)? = nil) {
+        guard let pending else { return }
+        self.pending = nil
+        if let error { pending.resume(throwing: error) } else { pending.resume() }
+    }
+
+    /// 캡처 콜백을 흉내낸다.
+    func emitAudio(frames: AVAudioFrameCount = 4800, startFrame: Int = 0, format: AVAudioFormat? = nil) {
+        sink?(sine(format ?? self.format, frames: frames, startFrame: startFrame))
+    }
+}
+
+// MARK: - 가짜 Speech 엔진
+
+struct SessionPlan: Sendable {
+    var installFractions: [Double] = []
+    var installFails = false
+    var installBlocks = false
+    /// `considering:`이 있는 협상이 nil을 돌려준다.
+    var consideringNegotiationFails = false
+    /// `considering:` 없는 협상도 nil을 돌려준다.
+    var plainNegotiationFails = false
+    var startFails = false
+    var drainsInput = true
+    var setLanguageSucceeds = true
+}
+
+final class FakeSpeechEngine: SpeechEngine, @unchecked Sendable {
+    struct Behavior: Sendable {
+        var supportedLocaleIDs: Set<String> = ["ko-KR", "en-US"]
+        var alreadyReservedIDs: [String] = []
+        var reserveThrows = false
+        var reserveReturns = true
+        var plan = SessionPlan()
+    }
+
+    let behavior: Locked<Behavior>
+    let log = Locked<[String]>([])
+    let sessions = Locked<[FakeSpeechSession]>([])
+    let sessionCreated = Signal()
+
+    init(_ behavior: Behavior = Behavior()) { self.behavior = Locked(behavior) }
+
+    @MainActor var latestSession: FakeSpeechSession? { sessions.wrapped.last }
+
+    func supportedLocale(equivalentTo locale: Locale) async -> Locale? {
+        let ids = behavior.wrapped.supportedLocaleIDs
+        let normalized = locale.identifier.replacingOccurrences(of: "_", with: "-")
+        return ids.contains(normalized) ? Locale(identifier: normalized) : nil
+    }
+
+    func reservedLocales() async -> [Locale] {
+        behavior.wrapped.alreadyReservedIDs.map { Locale(identifier: $0) }
+    }
+
+    func reserve(locale: Locale) async throws -> Bool {
+        log.mutate { $0.append("reserve:\(locale.identifier)") }
+        if behavior.wrapped.reserveThrows { throw TestError.reserveFailed }
+        return behavior.wrapped.reserveReturns
+    }
+
+    func release(locale: Locale) async {
+        log.mutate { $0.append("release:\(locale.identifier)") }
+    }
+
+    func makeSession(locale: Locale, sensitivity: DetectorSensitivity) throws -> any SpeechSession {
+        let session = FakeSpeechSession(locale: locale, sensitivity: sensitivity, plan: behavior.wrapped.plan)
+        sessions.mutate { $0.append(session) }
+        Task { @MainActor in sessionCreated.fire() }
+        return session
+    }
+}
+
+final class FakeSpeechSession: SpeechSession, @unchecked Sendable {
+    struct State {
+        var installCalls = 0
+        var installFinished = false
+        var negotiationArguments: [AVAudioFormat?] = []
+        var preparedFormat: AVAudioFormat?
+        var receivedBuffers: [AVAudioPCMBuffer] = []
+        var finishCount = 0
+        var languageSwaps: [Locale] = []
+        var continuation: AsyncThrowingStream<TranscriptionChunk, any Error>.Continuation?
+        var inputError: (any Error)?
+    }
+
+    let locale: Locale
+    let sensitivity: DetectorSensitivity
+    let plan: SessionPlan
+    let state = Locked(State())
+    let started = Signal()
+    let inputFailed = Signal()
+    let finished = Signal()
+    private let installGate = Locked<CheckedContinuation<Void, any Error>?>(nil)
+    private let drain = Locked<Task<Void, Never>?>(nil)
+
+    init(locale: Locale, sensitivity: DetectorSensitivity, plan: SessionPlan) {
+        self.locale = locale
+        self.sensitivity = sensitivity
+        self.plan = plan
+    }
+
+    func installAssets(progress: @escaping @Sendable (Double) -> Void) async throws {
+        state.mutate { $0.installCalls += 1 }
+        for fraction in plan.installFractions { progress(fraction) }
+        if plan.installBlocks {
+            try await withTaskCancellationHandler {
+                try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, any Error>) in
+                    installGate.mutate { $0 = continuation }
+                }
+            } onCancel: {
+                releaseInstall(throwing: CancellationError())
+            }
+        }
+        if plan.installFails { throw TestError.installFailed }
+        state.mutate { $0.installFinished = true }
+    }
+
+    /// 다운로드가 취소를 무시하고 "완료"되는 상황을 만든다.
+    func releaseInstall(throwing error: (any Error)? = nil) {
+        guard let continuation = installGate.mutate({ state -> CheckedContinuation<Void, any Error>? in
+            defer { state = nil }
+            return state
+        }) else { return }
+        if let error { continuation.resume(throwing: error) } else { continuation.resume() }
+    }
+
+    func bestAudioFormat(considering natural: AVAudioFormat?) async -> AVAudioFormat? {
+        state.mutate { $0.negotiationArguments.append(natural) }
+        if natural != nil { return plan.consideringNegotiationFails ? nil : analysisFormat }
+        return plan.plainNegotiationFails ? nil : analysisFormat
+    }
+
+    func start(format: AVAudioFormat, input: AudioInputQueue) async throws -> AsyncThrowingStream<TranscriptionChunk, any Error> {
+        if plan.startFails { throw TestError.startFailed }
+        let (stream, continuation) = AsyncThrowingStream<TranscriptionChunk, any Error>.makeStream()
+        state.mutate {
+            $0.preparedFormat = format
+            $0.continuation = continuation
+        }
+        if plan.drainsInput {
+            let task = Task { [state, inputFailed] in
+                do {
+                    for try await buffer in input {
+                        state.mutate { $0.receivedBuffers.append(buffer) }
+                    }
+                } catch {
+                    state.mutate { $0.inputError = error }
+                    continuation.finish(throwing: error)
+                    await inputFailed.fire()
+                }
+            }
+            drain.mutate { $0 = task }
+        }
+        Task { @MainActor in started.fire() }
+        return stream
+    }
+
+    func setLanguage(_ locale: Locale) async throws -> Bool {
+        state.mutate { $0.languageSwaps.append(locale) }
+        return plan.setLanguageSucceeds
+    }
+
+    func finish() async {
+        drain.mutate { $0?.cancel(); $0 = nil }
+        state.mutate {
+            $0.finishCount += 1
+            $0.continuation?.finish()
+            $0.continuation = nil
+        }
+        await finished.fire()
+    }
+
+    /// 분석기가 결과를 내보내는 것을 흉내낸다.
+    func emit(_ text: String, isFinal: Bool, start: Double, end: Double) {
+        state.wrapped.continuation?.yield(
+            TranscriptionChunk(text: text, isFinal: isFinal, start: start, end: end))
+    }
+
+    func emitFailure(_ error: any Error) {
+        state.wrapped.continuation?.finish(throwing: error)
+    }
+}
+
+// MARK: - 조립
+
+@MainActor
+struct Harness {
+    let engine: FakeSpeechEngine
+    let pipeline: SpeechPipeline
+    let controller: PipelineController
+    let events = Locked<[PipelineEvent]>([])
+    let states = Locked<[PipelineController.State]>([])
+    let sourceBox = Locked<FakeAudioSource?>(nil)
+    let eventArrived = Signal()
+    let stateChanged = Signal()
+    let sourceCreated = Signal()
+
+    init(engine: FakeSpeechEngine = FakeSpeechEngine(),
+         sourceFormat: AVAudioFormat = micFormat48kStereo,
+         blockSourceStart: Bool = false) {
+        self.engine = engine
+        let box = sourceBox
+        let created = sourceCreated
+        pipeline = SpeechPipeline(engine: engine, makeSource: { _ in
+            let source = FakeAudioSource(format: sourceFormat)
+            source.blocksUntilReleased = blockSourceStart
+            box.mutate { $0 = source }
+            created.fire()
+            return source
+        })
+        controller = PipelineController(pipeline: pipeline)
+        let events = self.events
+        let states = self.states
+        let eventArrived = self.eventArrived
+        let stateChanged = self.stateChanged
+        controller.onEvent = { event in
+            events.mutate { $0.append(event) }
+            eventArrived.fire()
+        }
+        controller.onState = { state in
+            states.mutate { $0.append(state) }
+            stateChanged.fire()
+        }
+    }
+
+    var source: FakeAudioSource? { sourceBox.wrapped }
+
+    /// controller가 `.listening`에 도달할 때까지 기다린다. 이벤트로만 진행한다.
+    func waitUntilListening() async {
+        while controller.state != .listening {
+            await stateChanged.wait()
+        }
+    }
+
+    func waitForState(_ predicate: (PipelineController.State) -> Bool) async {
+        while !predicate(controller.state) {
+            await stateChanged.wait()
+        }
+    }
+
+    func waitForEvent(_ predicate: (PipelineEvent) -> Bool) async {
+        while !events.wrapped.contains(where: predicate) {
+            await eventArrived.wait()
+        }
+    }
+
+    var transcripts: [TranscriptEvent] {
+        events.wrapped.compactMap {
+            if case .transcript(let event) = $0.kind { return event }
+            return nil
+        }
+    }
+}
+
+let koreanConfig = PipelineConfiguration(source: .microphone, language: .korean, sensitivity: .medium)
+let englishConfig = PipelineConfiguration(source: .microphone, language: .english, sensitivity: .medium)
+
+// MARK: - A. 포맷 협상과 백프레셔
+
+@Test @MainActor func 협상은_캡처_포맷을_먼저_고려한다() async {
+    let harness = Harness()
+    harness.controller.requestStart(configuration: koreanConfig)
+    await harness.waitUntilListening()
+
+    let arguments = harness.engine.latestSession!.state.wrapped.negotiationArguments
+    #expect(arguments.count == 1)
+    #expect(arguments[0] === micFormat48kStereo)
+}
+
+@Test @MainActor func considering_협상이_실패하면_기본_오버로드로_다시_시도한다() async {
+    var behavior = FakeSpeechEngine.Behavior()
+    behavior.plan.consideringNegotiationFails = true
+    let harness = Harness(engine: FakeSpeechEngine(behavior))
+    harness.controller.requestStart(configuration: koreanConfig)
+    await harness.waitUntilListening()
+
+    let arguments = harness.engine.latestSession!.state.wrapped.negotiationArguments
+    #expect(arguments.count == 2)
+    #expect(arguments[1] == nil)
+}
+
+@Test @MainActor func 협상이_둘_다_실패하면_시작에_실패한다() async {
+    var behavior = FakeSpeechEngine.Behavior()
+    behavior.plan.consideringNegotiationFails = true
+    behavior.plan.plainNegotiationFails = true
+    let harness = Harness(engine: FakeSpeechEngine(behavior))
+    harness.controller.requestStart(configuration: koreanConfig)
+    await harness.waitForState { if case .failed = $0 { return true }; return false }
+
+    #expect(harness.engine.latestSession!.state.wrapped.preparedFormat == nil)
+}
+
+@Test @MainActor func 분석기에는_협상된_포맷이_전달된다() async {
+    let harness = Harness()
+    harness.controller.requestStart(configuration: koreanConfig)
+    await harness.waitUntilListening()
+
+    let prepared = harness.engine.latestSession!.state.wrapped.preparedFormat
+    #expect(prepared === analysisFormat)
+    #expect(prepared !== micFormat48kStereo)
+}
+
+@Test func 사십팔킬로_스테레오_입력이_분석_포맷으로_변환된다() async throws {
+    let queue = AudioInputQueue(analysisFormat: analysisFormat)
+    let chunk: AVAudioFrameCount = 4800 // 100ms * 10 = 1초
+    for index in 0..<10 {
+        queue.ingest(sine(micFormat48kStereo, frames: chunk, startFrame: Int(chunk) * index))
+    }
+    queue.finish()
+
+    var frames = 0
+    for try await buffer in queue {
+        #expect(buffer.format.sampleRate == 16000)
+        #expect(buffer.format.channelCount == 1)
+        #expect(buffer.format.commonFormat == .pcmFormatInt16)
+        frames += Int(buffer.frameLength)
+    }
+    // 리샘플러의 프라이밍 지연 때문에 정확히 맞지는 않는다(5A 테스트와 같은 허용치).
+    #expect(abs(frames - 16000) <= 320)
+}
+
+@Test func 사십사점일킬로_모노_입력이_분석_포맷으로_변환되고_경계가_이어진다() async throws {
+    let queue = AudioInputQueue(analysisFormat: analysisFormat)
+    let chunk: AVAudioFrameCount = 4410
+    for index in 0..<4 {
+        queue.ingest(sine(micFormat44kMono, frames: chunk, startFrame: Int(chunk) * index))
+    }
+    queue.finish()
+
+    var samples: [Int16] = []
+    for try await buffer in queue {
+        #expect(buffer.format.sampleRate == 16000)
+        #expect(buffer.format.channelCount == 1)
+        samples.append(contentsOf: int16Samples(buffer))
+    }
+    // 0.4초 분량 → 16kHz 기준 6400 프레임 근처.
+    #expect(abs(samples.count - 6400) <= 128)
+    // 청크 경계에서 위상이 끊기면 인접 샘플 차이가 튄다. 220Hz 사인파의 한 스텝
+    // 최대 변화폭은 진폭의 10% 미만이므로 그 몇 배를 넘는 점프가 없어야 한다.
+    let jumps = zip(samples, samples.dropFirst()).map { abs(Int($1) - Int($0)) }
+    #expect(jumps.max() ?? 0 < 6000)
+}
+
+@Test func 입력_포맷이_바뀌면_변환기를_새로_만든다() async throws {
+    let queue = AudioInputQueue(analysisFormat: analysisFormat)
+    queue.ingest(sine(micFormat48kStereo, frames: 4800))
+    queue.ingest(sine(micFormat44kMono, frames: 4410))
+    queue.finish()
+
+    var frames = 0
+    for try await buffer in queue {
+        #expect(buffer.format.sampleRate == 16000)
+        frames += Int(buffer.frameLength)
+    }
+    // 두 입력 모두 0.1초 → 합쳐서 0.2초(≈3200프레임). 포맷 변경을 무시하고 첫 변환기를
+    // 계속 썼다면 두 번째 청크가 통째로 사라져 절반 근처에 머문다.
+    #expect(frames > 2400)
+    #expect(frames < 4000)
+}
+
+@Test func 입력_큐가_이초를_넘기면_버리지_않고_오류를_낸다() async throws {
+    let queue = AudioInputQueue(analysisFormat: analysisFormat, maximumSeconds: 0.5)
+    // 0.5초 상한에 1초를 밀어 넣는다.
+    queue.ingest(sine(micFormat48kStereo, frames: 48000))
+
+    var thrown: (any Error)?
+    do {
+        for try await _ in queue {}
+    } catch {
+        thrown = error
+    }
+    #expect(thrown as? AudioInputQueueError == .overflow)
+}
+
+@Test @MainActor func 입력_큐가_넘치면_오류를_알리고_실행을_멈춘다() async throws {
+    var behavior = FakeSpeechEngine.Behavior()
+    behavior.plan.drainsInput = true
+    let harness = Harness(engine: FakeSpeechEngine(behavior))
+    harness.controller.requestStart(configuration: koreanConfig)
+    await harness.waitUntilListening()
+
+    // 소비자를 굶긴 상태에서 2초 상한을 넘겨 밀어 넣는다.
+    let session = harness.engine.latestSession!
+    session.emitFailure(AudioInputQueueError.overflow)
+
+    await harness.waitForState { if case .failed = $0 { return true }; return false }
+    #expect(harness.controller.state == .failed(AudioInputQueueError.overflow.localizedDescription))
+    // 오류를 낸 뒤에는 실행을 정지한다 — PCM을 조용히 버리며 계속 돌지 않는다.
+    await session.finished.wait()
+    #expect(session.state.wrapped.finishCount == 1)
+    #expect(harness.source!.stopCount == 1)
+}
+
+// MARK: - B. 실행 소유권과 취소
+
+@Test @MainActor func 시작_도중_정지하면_캡처가_켜지지_않는다() async {
+    var behavior = FakeSpeechEngine.Behavior()
+    behavior.plan.installBlocks = true
+    let engine = FakeSpeechEngine(behavior)
+    let harness = Harness(engine: engine)
+
+    harness.controller.requestStart(configuration: koreanConfig)
+    await engine.sessionCreated.wait()
+    let session = engine.latestSession!
+    // 설치 중에 정지 요청.
+    harness.controller.requestStop()
+    // 다운로드가 취소를 무시하고 "성공"으로 끝난다.
+    session.releaseInstall()
+
+    await harness.waitForState { $0 == .stopped }
+    #expect(harness.source == nil)                       // 소스를 만들지도 않았다
+    #expect(session.state.wrapped.preparedFormat == nil) // 분석을 시작하지도 않았다
+    #expect(harness.controller.state == .stopped)
+}
+
+@Test @MainActor func 소스_시작이_매달려_있어도_정지_요청이_교착되지_않는다() async {
+    // source.start가 영원히 반환하지 않는 상황. worker가 시작 완료만 기다리면 여기서 멈춘다.
+    let harness = Harness(blockSourceStart: true)
+    harness.controller.requestStart(configuration: koreanConfig)
+    await harness.sourceCreated.wait()
+    let source = harness.source!
+    await source.startSuspended.wait()
+    #expect(harness.controller.state == .starting)
+
+    harness.controller.requestStop()
+    await harness.waitForState { $0 == .stopped }
+
+    #expect(source.stopCount == 1)
+    // 캡처가 시작되지 않았으니 분석도 시작되지 않는다.
+    #expect(harness.engine.latestSession!.state.wrapped.preparedFormat == nil)
+    #expect(harness.engine.latestSession!.state.wrapped.finishCount == 1)
+}
+
+@Test @MainActor func 매달린_시작을_다른_요청이_밀어내도_마지막_요청만_산다() async {
+    let harness = Harness(blockSourceStart: true)
+    harness.controller.requestStart(configuration: koreanConfig)
+    await harness.sourceCreated.wait()
+    await harness.source!.startSuspended.wait()
+
+    // 매달린 첫 실행 위로 새 요청이 들어온다. 첫 실행은 취소 핸들러로 풀려 정리된다.
+    harness.controller.requestStop()
+    await harness.waitForState { $0 == .stopped }
+
+    let firstSession = harness.engine.sessions.wrapped[0]
+    #expect(firstSession.state.wrapped.finishCount == 1)
+    #expect(harness.engine.sessions.wrapped.count == 1)
+}
+
+@Test @MainActor func 시작_실패는_실패_상태로_보고된다() async {
+    var behavior = FakeSpeechEngine.Behavior()
+    behavior.plan.startFails = true
+    let harness = Harness(engine: FakeSpeechEngine(behavior))
+
+    harness.controller.requestStart(configuration: koreanConfig)
+    await harness.waitForState { if case .failed = $0 { return true }; return false }
+
+    #expect(harness.controller.state == .failed(TestError.startFailed.localizedDescription))
+    // 실패해도 잡았던 자원은 같은 순서로 되돌린다.
+    #expect(harness.source!.stopCount == 1)
+    #expect(harness.engine.latestSession!.state.wrapped.finishCount == 1)
+}
+
+@Test @MainActor func 지원하지_않는_언어는_시작에_실패한다() async {
+    var behavior = FakeSpeechEngine.Behavior()
+    behavior.supportedLocaleIDs = ["en-US"]
+    let harness = Harness(engine: FakeSpeechEngine(behavior))
+
+    harness.controller.requestStart(configuration: koreanConfig)
+    await harness.waitForState { if case .failed = $0 { return true }; return false }
+    #expect(harness.controller.state == .failed(PipelineError.unsupportedLanguage("한국어").localizedDescription))
+}
+
+@Test @MainActor func 연속_전환에서_마지막_요청만_살아남는다() async {
+    let harness = Harness()
+    harness.controller.requestStart(configuration: koreanConfig)
+    harness.controller.requestStop()
+    harness.controller.requestStart(configuration: englishConfig)
+    harness.controller.requestStop()
+    harness.controller.requestStart(configuration: koreanConfig)
+
+    await harness.waitUntilListening()
+    #expect(harness.controller.state == .listening)
+    // 살아남은 실행은 마지막 요청의 언어다.
+    let listening = harness.events.wrapped.last { if case .listening = $0.kind { return true }; return false }
+    #expect(listening?.kind == .listening(language: .korean))
+    // 앞선 실행들은 전부 정리됐다.
+    let sessions = harness.engine.sessions.wrapped
+    for session in sessions.dropLast() {
+        #expect(session.state.wrapped.finishCount >= 1)
+    }
+}
+
+@Test @MainActor func 이전_실행의_결과와_오류는_무시된다() async {
+    let harness = Harness()
+    harness.controller.requestStart(configuration: koreanConfig)
+    await harness.waitUntilListening()
+    let stale = harness.engine.latestSession!
+
+    harness.controller.requestStop()
+    await harness.waitForState { $0 == .stopped }
+
+    harness.controller.requestStart(configuration: koreanConfig)
+    await harness.waitUntilListening()
+
+    // 옛 실행이 뒤늦게 결과와 오류를 뱉는다.
+    stale.emit("옛 결과", isFinal: true, start: 0, end: 1)
+    stale.emitFailure(TestError.startFailed)
+
+    let fresh = harness.engine.latestSession!
+    fresh.emit("새 결과", isFinal: false, start: 0, end: 1)
+    await harness.waitForEvent { if case .transcript = $0.kind { return true }; return false }
+
+    #expect(harness.transcripts.map(\.text) == ["새 결과"])
+    #expect(harness.controller.state == .listening)
+}
+
+@Test @MainActor func 다운로드가_실패해도_진행률_태스크가_남지_않는다() async {
+    var behavior = FakeSpeechEngine.Behavior()
+    behavior.plan.installFractions = [0.25, 0.5]
+    behavior.plan.installFails = true
+    let harness = Harness(engine: FakeSpeechEngine(behavior))
+
+    harness.controller.requestStart(configuration: koreanConfig)
+    await harness.waitForState { if case .failed = $0 { return true }; return false }
+
+    #expect(harness.controller.state == .failed(TestError.installFailed.localizedDescription))
+    // 진행률은 보고됐고, 실패 뒤에 추가로 흘러나오지 않는다.
+    let installing = harness.events.wrapped.filter { if case .installing = $0.kind { return true }; return false }
+    #expect(!installing.isEmpty)
+    let countAfterFailure = installing.count
+    #expect(harness.events.wrapped.filter { if case .installing = $0.kind { return true }; return false }.count == countAfterFailure)
+}
+
+@Test @MainActor func 예약이_항상_실패해도_전사는_시작된다() async {
+    var behavior = FakeSpeechEngine.Behavior()
+    behavior.reserveThrows = true
+    let harness = Harness(engine: FakeSpeechEngine(behavior))
+
+    harness.controller.requestStart(configuration: koreanConfig)
+    await harness.waitUntilListening()
+
+    #expect(harness.engine.log.wrapped.contains("reserve:ko-KR"))
+    #expect(harness.engine.latestSession!.state.wrapped.preparedFormat === analysisFormat)
+}
+
+@Test @MainActor func 이미_예약된_locale은_다시_예약하지_않는다() async {
+    var behavior = FakeSpeechEngine.Behavior()
+    behavior.alreadyReservedIDs = ["ko-KR"]
+    let harness = Harness(engine: FakeSpeechEngine(behavior))
+
+    harness.controller.requestStart(configuration: koreanConfig)
+    await harness.waitUntilListening()
+    harness.controller.requestStop()
+    await harness.waitForState { $0 == .stopped }
+
+    // 예약하지 않았으니 해제도 하지 않는다 — 다른 실행의 예약을 뺏지 않는다.
+    #expect(harness.engine.log.wrapped.isEmpty)
+}
+
+@Test @MainActor func 이_실행이_예약한_locale은_정지할_때_해제한다() async {
+    let harness = Harness()
+    harness.controller.requestStart(configuration: koreanConfig)
+    await harness.waitUntilListening()
+    harness.controller.requestStop()
+    await harness.waitForState { $0 == .stopped }
+
+    #expect(harness.engine.log.wrapped == ["reserve:ko-KR", "release:ko-KR"])
+}
+
+@Test @MainActor func 언어만_바뀌면_모듈만_교체하고_실행을_유지한다() async {
+    let harness = Harness()
+    harness.controller.requestStart(configuration: koreanConfig)
+    await harness.waitUntilListening()
+    let session = harness.engine.latestSession!
+
+    harness.controller.requestReconfigure(configuration: englishConfig)
+    await harness.waitForEvent { $0.kind == .listening(language: .english) }
+
+    #expect(harness.engine.sessions.wrapped.count == 1)      // 재시작하지 않았다
+    #expect(session.state.wrapped.languageSwaps.map(\.identifier) == ["en-US"])
+    #expect(session.state.wrapped.finishCount == 0)
+    #expect(harness.source!.stopCount == 0)
+}
+
+@Test @MainActor func 모듈_교체가_불가능하면_재시작한다() async {
+    var behavior = FakeSpeechEngine.Behavior()
+    behavior.plan.setLanguageSucceeds = false
+    let harness = Harness(engine: FakeSpeechEngine(behavior))
+    harness.controller.requestStart(configuration: koreanConfig)
+    await harness.waitUntilListening()
+
+    harness.controller.requestReconfigure(configuration: englishConfig)
+    await harness.waitForEvent { $0.kind == .listening(language: .english) }
+
+    #expect(harness.engine.sessions.wrapped.count == 2)
+    #expect(harness.engine.sessions.wrapped[0].state.wrapped.finishCount == 1)
+}
+
+@Test @MainActor func 민감도가_바뀌면_재시작한다() async {
+    let harness = Harness()
+    harness.controller.requestStart(configuration: koreanConfig)
+    await harness.waitUntilListening()
+
+    var changed = koreanConfig
+    changed.sensitivity = .high
+    harness.controller.requestReconfigure(configuration: changed)
+    await harness.waitForState { $0 == .starting }
+    await harness.waitUntilListening()
+
+    #expect(harness.engine.sessions.wrapped.count == 2)
+    #expect(harness.engine.sessions.wrapped[1].sensitivity == .high)
+}
+
+@Test @MainActor func 시작_요청만으로는_listening_상태가_되지_않는다() async {
+    var behavior = FakeSpeechEngine.Behavior()
+    behavior.plan.installBlocks = true
+    let engine = FakeSpeechEngine(behavior)
+    let harness = Harness(engine: engine)
+
+    harness.controller.requestStart(configuration: koreanConfig)
+    await engine.sessionCreated.wait()
+    #expect(harness.controller.state == .starting)
+
+    engine.latestSession!.releaseInstall()
+    await harness.waitUntilListening()
+}
+
+// MARK: - C. 전사 이벤트 식별
+
+@Test func 같은_구간의_갱신과_final은_같은_발화다() {
+    var ledger = UtteranceLedger()
+    let first = ledger.assign(start: 0, end: 1, isFinal: false)
+    let second = ledger.assign(start: 0, end: 2, isFinal: false)
+    let third = ledger.assign(start: 0, end: 2.4, isFinal: true)
+
+    #expect(first.id == second.id)
+    #expect(second.id == third.id)
+    #expect(first.revision == 0)
+    #expect(second.revision == 1)
+    #expect(third.revision == 2)
+}
+
+@Test func 같은_문장을_다른_구간에서_두_번_말하면_다른_발화다() {
+    var ledger = UtteranceLedger()
+    let first = ledger.assign(start: 0, end: 1.5, isFinal: true)
+    let second = ledger.assign(start: 3, end: 4.5, isFinal: true)
+    #expect(first.id != second.id)
+}
+
+@Test func 확정_뒤의_같은_시작_구간은_새_발화다() {
+    var ledger = UtteranceLedger()
+    let first = ledger.assign(start: 0, end: 1, isFinal: true)
+    let second = ledger.assign(start: 0, end: 1, isFinal: false)
+    #expect(first.id != second.id)
+}
+
+@Test func 언어를_바꾸면_이전_발화에_잇지_않는다() {
+    var ledger = UtteranceLedger()
+    let before = ledger.assign(start: 0, end: 1, isFinal: false)
+    ledger.breakUtterance()
+    let after = ledger.assign(start: 0, end: 1.2, isFinal: false)
+    #expect(before.id != after.id)
+}
+
+@Test @MainActor func 전사_이벤트는_실행ID_발화ID_수정번호_언어를_함께_싣는다() async {
+    let harness = Harness()
+    harness.controller.requestStart(configuration: koreanConfig)
+    await harness.waitUntilListening()
+    let session = harness.engine.latestSession!
+
+    session.emit("안녕", isFinal: false, start: 0, end: 1)
+    session.emit("안녕하세요", isFinal: true, start: 0, end: 1.4)
+    await harness.waitForEvent { if case .transcript(let e) = $0.kind { return e.isFinal }; return false }
+
+    let events = harness.transcripts
+    #expect(events.count == 2)
+    #expect(events[0].utteranceID == events[1].utteranceID)
+    #expect(events[0].revision == 0 && events[1].revision == 1)
+    #expect(events.allSatisfy { $0.sourceLanguage == .korean })
+    #expect(harness.events.wrapped.allSatisfy { $0.runID == harness.controller.currentGeneration })
+}
+
+@Test @MainActor func 교차_도착한_옛_구간의_final이_최신_원문을_되돌리지_않는다() async {
+    let harness = Harness()
+    harness.controller.requestStart(configuration: koreanConfig)
+    await harness.waitUntilListening()
+    let session = harness.engine.latestSession!
+
+    session.emit("첫 문장", isFinal: false, start: 0, end: 1)
+    session.emit("두 번째 문장", isFinal: false, start: 2, end: 3)     // 다음 구간이 먼저 도착
+    session.emit("첫 문장입니다", isFinal: true, start: 0, end: 1.5)   // 옛 구간의 final이 뒤늦게
+    await harness.waitForEvent {
+        if case .transcript(let e) = $0.kind { return e.text == "첫 문장입니다" }
+        return false
+    }
+
+    let events = harness.transcripts
+    #expect(events.count == 3)
+    #expect(events[0].utteranceID != events[1].utteranceID)
+    #expect(events[2].utteranceID == events[0].utteranceID)  // 옛 구간의 final은 옛 발화에 붙는다
+
+    // 한 줄 라벨은 최신 발화를 잃지 않는다.
+    var latest = LatestCaption()
+    for event in events { _ = latest.apply(event) }
+    #expect(latest.text == "두 번째 문장")
+}
+
+@Test func 언어_전환_뒤의_이벤트는_새_언어를_싣는다() {
+    // 이벤트의 언어는 생성 시점 값으로 고정된다.
+    let korean = TranscriptEvent(utteranceID: 1, revision: 0, sourceLanguage: .korean, transcript: .final("안녕"))
+    let english = TranscriptEvent(utteranceID: 2, revision: 0, sourceLanguage: .english, transcript: .final("hello"))
+    #expect(korean.sourceLanguage == .korean)
+    #expect(english.sourceLanguage == .english)
+}
