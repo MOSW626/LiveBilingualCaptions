@@ -139,28 +139,34 @@ private struct Emission: Equatable {
     let captionID: UUID
 }
 
-/// 1. partial 요청 → final 요청 → final 응답 → partial의 늦은 응답. 늦게 온 partial 응답은 버려진다.
+/// 1. 한 줄 안에서 partial 요청 → final 요청 → final 응답 → partial의 늦은 응답.
+///    늦게 온 partial 응답은 버려진다.
+///
+///    **같은 captionID를 쓴다.** 예전에는 서로 다른 ID로 이 시나리오를 썼는데, 자막이
+///    한 줄뿐이라 "새 발화 = 이전 것 무효"가 성립하던 시절의 전제였다. 지금은 두 ID면
+///    두 줄이고 둘 다 화면에 있으므로 둘 다 번역돼야 한다(아래
+///    `다른_줄의_제출은_서로의_번역을_취소하지_않는다`가 그 경우를 고정한다).
+///    여기서 지킬 규칙은 "**같은 줄의** 낡은 제출은 버린다"는 것이다.
 @Test @MainActor func 회귀_partial_다음_final이_오면_늦게_도착한_partial_응답은_버려진다() async {
     let gate = CallGate<String?>()
     let translator = Translator(table: .default, translate: { text, _, _ in await gate.call() })
     var received: [Emission] = []
     translator.onTranslation = { text, refined, id in received.append(Emission(text: text, refined: refined, captionID: id)) }
 
-    let idA = UUID()
-    let taskA = translator.submit(.partial("A문장"), from: .korean, captionID: idA)
-    let callA = await gate.nextCallStarted() // A의 220ms 디바운스가 끝나고 translate 안에서 대기 중
+    let line = UUID()
+    let taskA = translator.submit(.partial("A문장"), from: .korean, captionID: line)
+    let callA = await gate.nextCallStarted() // 220ms 디바운스가 끝나고 translate 안에서 대기 중
 
-    let idB = UUID()
-    let taskB = translator.submit(.final("B문장"), from: .korean, captionID: idB)
+    let taskB = translator.submit(.final("A문장입니다"), from: .korean, captionID: line)
     let callB = await gate.nextCallStarted()
 
-    gate.resume(callB, with: "[번역] B문장")
+    gate.resume(callB, with: "[번역] A문장입니다")
     await taskB?.value
 
-    gate.resume(callA, with: "[번역] A문장") // A가 먼저 요청됐지만 응답은 B보다 늦게 도착한다
+    gate.resume(callA, with: "[번역] A문장") // 먼저 요청됐지만 응답은 final보다 늦게 도착한다
     await taskA?.value
 
-    #expect(received == [Emission(text: "[번역] B문장", refined: false, captionID: idB)])
+    #expect(received == [Emission(text: "[번역] A문장입니다", refined: false, captionID: line)])
 }
 
 /// 2. final 초안(A) 표시 → 원문이 B로 갱신 → A의 LLM 보정 응답이 뒤늦게 도착. 버려진다.
@@ -171,24 +177,21 @@ private struct Emission: Equatable {
     var received: [Emission] = []
     translator.onTranslation = { text, refined, id in received.append(Emission(text: text, refined: refined, captionID: id)) }
 
-    let idA = UUID()
-    let taskA = translator.submit(.final("A문장"), from: .korean, captionID: idA)
-    let callA = await refiner.gate.nextCallStarted() // A의 초안은 이미 나갔고, 보정이 시작된 뒤다
+    // 같은 줄이다. 한 줄의 원문이 갱신되는 상황을 재현해야 하므로 captionID를 공유한다.
+    let line = UUID()
+    let taskA = translator.submit(.final("A문장"), from: .korean, captionID: line)
+    let callA = await refiner.gate.nextCallStarted() // 초안은 이미 나갔고, 보정이 시작된 뒤다
 
-    let idB = UUID()
-    let taskB = translator.submit(.final("B문장"), from: .korean, captionID: idB)
-    let callB = await refiner.gate.nextCallStarted()
-
-    refiner.gate.resume(callB, with: "[번역] B문장 (보정됨)")
+    // 같은 줄의 원문이 갱신된다. 초안은 새로 나가고, 낡은 보정 요청은 무효가 된다.
+    let taskB = translator.submit(.final("A문장 수정본"), from: .korean, captionID: line)
     await taskB?.value
 
-    refiner.gate.resume(callA, with: "[번역] A문장 (보정됨)")
+    refiner.gate.resume(callA, with: "[번역] A문장 (보정됨)") // 낡은 원문의 뒤늦은 보정
     await taskA?.value
 
     #expect(received == [
-        Emission(text: "[번역] A문장", refined: false, captionID: idA),
-        Emission(text: "[번역] B문장", refined: false, captionID: idB),
-        Emission(text: "[번역] B문장 (보정됨)", refined: true, captionID: idB)
+        Emission(text: "[번역] A문장", refined: false, captionID: line),
+        Emission(text: "[번역] A문장 수정본", refined: false, captionID: line)
     ])
 }
 
@@ -287,4 +290,120 @@ private struct Emission: Equatable {
     await taskB?.value
 
     #expect(received.isEmpty)
+}
+
+
+// MARK: - FIX 7: 취소는 줄 단위다
+//
+// 예전 Translator는 pending/generation을 전역으로 하나씩만 들고 있어서, 어떤 줄의
+// 제출이든 다른 줄의 진행 중 번역을 취소했다. 자막 목록이 옛 발화의 뒤늦은 final을
+// 다시 제출하게 되면서(CaptionState.apply) 이게 실제 결함이 됐다: 사용자가 방금 말한
+// 줄의 번역이 날아가고, 말을 멈추면 되살릴 다음 이벤트도 없다.
+
+/// (a) 두 줄이 동시에 진행 중이어도 각자 자기 번역을 받는다.
+@Test @MainActor func 다른_줄의_제출은_서로의_번역을_취소하지_않는다() async {
+    let gate = CallGate<String?>()
+    let translator = Translator(table: .default, translate: { text, _, _ in await gate.call() })
+    var received: [Emission] = []
+    translator.onTranslation = { text, refined, id in received.append(Emission(text: text, refined: refined, captionID: id)) }
+
+    let idA = UUID()
+    let taskA = translator.submit(.final("A문장"), from: .korean, captionID: idA)
+    let callA = await gate.nextCallStarted()
+
+    let idB = UUID()   // A가 아직 게이트에서 대기 중인데 다른 줄이 제출된다
+    let taskB = translator.submit(.final("B문장"), from: .korean, captionID: idB)
+    let callB = await gate.nextCallStarted()
+
+    gate.resume(callA, with: "[번역] A문장")
+    gate.resume(callB, with: "[번역] B문장")
+    await taskA?.value
+    await taskB?.value
+
+    #expect(received.count == 2)
+    #expect(received.contains(Emission(text: "[번역] A문장", refined: false, captionID: idA)))
+    #expect(received.contains(Emission(text: "[번역] B문장", refined: false, captionID: idB)))
+}
+
+/// (b) **이 라운드의 회귀 테스트.** 사용자가 방금 말한 줄(B)이 번역 대기 중일 때
+///     옛 줄(A)의 뒤늦은 final이 다시 제출된다. 그 뒤 B의 번역이 도착한다.
+///
+///     테스트는 여기서 끝난다 — 뒤따르는 이벤트가 없다. 화자가 문장을 끝내고 쉬는
+///     바로 그 상황이고, 예전 구조라면 B는 영영 번역 없이 남았다.
+@Test @MainActor func 옛_줄의_뒤늦은_제출이_방금_말한_줄의_번역을_날리지_않는다() async {
+    let gate = CallGate<String?>()
+    let translator = Translator(table: .default, translate: { text, _, _ in await gate.call() })
+    var received: [Emission] = []
+    translator.onTranslation = { text, refined, id in received.append(Emission(text: text, refined: refined, captionID: id)) }
+
+    let older = UUID()
+    let newest = UUID()
+
+    // 사용자가 방금 말한 줄이 번역 대기 중이다.
+    let newestTask = translator.submit(.final("방금 말한 문장"), from: .korean, captionID: newest)
+    let newestCall = await gate.nextCallStarted()
+
+    // 그 사이 옛 구간의 final이 뒤늦게 도착해 다시 제출된다(CaptionState.apply 경로).
+    let olderTask = translator.submit(.final("옛 문장 확정본"), from: .korean, captionID: older)
+    let olderCall = await gate.nextCallStarted()
+
+    gate.resume(newestCall, with: "[번역] 방금 말한 문장")
+    await newestTask?.value
+
+    #expect(received.contains(Emission(text: "[번역] 방금 말한 문장", refined: false, captionID: newest)),
+            "옛 줄의 제출이 방금 말한 줄의 번역을 취소했다 — 화자가 멈추면 되살릴 이벤트가 없다")
+
+    gate.resume(olderCall, with: "[번역] 옛 문장 확정본")
+    await olderTask?.value
+    #expect(received.contains(Emission(text: "[번역] 옛 문장 확정본", refined: false, captionID: older)))
+}
+
+/// (c) reset()은 여전히 전부 취소한다 — 여러 줄이 떠 있어도 하나도 나가지 않는다.
+@Test @MainActor func reset은_진행_중인_모든_줄을_취소한다() async {
+    let gate = CallGate<String?>()
+    let translator = Translator(table: .default, translate: { text, _, _ in await gate.call() })
+    var received: [Emission] = []
+    translator.onTranslation = { text, refined, id in received.append(Emission(text: text, refined: refined, captionID: id)) }
+
+    let idA = UUID()
+    let taskA = translator.submit(.final("A문장"), from: .korean, captionID: idA)
+    let callA = await gate.nextCallStarted()
+    let idB = UUID()
+    let taskB = translator.submit(.final("B문장"), from: .korean, captionID: idB)
+    let callB = await gate.nextCallStarted()
+
+    translator.reset() // 언어쌍 변경·보정기 교체 — 화면의 모든 번역이 무의미해진다
+
+    gate.resume(callA, with: "[번역] A문장")
+    gate.resume(callB, with: "[번역] B문장")
+    await taskA?.value
+    await taskB?.value
+
+    #expect(received.isEmpty)
+}
+
+/// (d) 줄 상한을 넘으면 밀려난 줄만 취소되고 나머지는 멀쩡하다.
+@Test @MainActor func 줄_상한을_넘으면_밀려난_줄만_취소된다() async {
+    let gate = CallGate<String?>()
+    let translator = Translator(table: .default, translate: { text, _, _ in await gate.call() })
+    var received: [Emission] = []
+    translator.onTranslation = { text, refined, id in received.append(Emission(text: text, refined: refined, captionID: id)) }
+
+    let limit = Translator.lineLimit
+    var ids: [UUID] = []
+    var tasks: [Task<Void, Never>?] = []
+    var calls: [Int] = []
+    for i in 0...limit { // 상한 + 1 줄 → 가장 오래된 줄이 밀려난다
+        let id = UUID()
+        ids.append(id)
+        tasks.append(translator.submit(.final("문장\(i)"), from: .korean, captionID: id))
+        calls.append(await gate.nextCallStarted())
+    }
+    for (i, call) in calls.enumerated() { gate.resume(call, with: "[번역] 문장\(i)") }
+    for task in tasks { await task?.value }
+
+    #expect(received.count == limit)
+    #expect(!received.contains { $0.captionID == ids[0] }) // 밀려난 줄은 나가지 않는다
+    // 방출 "순서"는 게이트를 한꺼번에 풀 때 보장되지 않는다 — 고정할 값은 집합이다.
+    #expect(Set(received.map(\.captionID)) == Set(ids.dropFirst()))
 }

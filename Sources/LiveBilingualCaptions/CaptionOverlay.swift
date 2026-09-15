@@ -63,6 +63,8 @@ struct CaptionOverlay: View {
         // 것이므로 밝기를 환경에 맡기지 않고 어둡게 고정한다.
         .background(.black.opacity(0.5), in: .rect(cornerRadius: 20))
         .background(.ultraThinMaterial, in: .rect(cornerRadius: 20))
+        // 부수효과: 아래 .bordered 버튼들도 어두운 테마(밝은 글자)로 바뀐다. 의도한 것이다 —
+        // 어두운 HUD 위의 버튼이라 그게 맞다. "밝은 테마로 되돌리는" 수정을 하지 말 것.
         .environment(\.colorScheme, .dark)
         .onGeometryChange(for: CGFloat.self) { $0.size.height } action: { onHeight($0) }
         // 창이 아직 줄어들기 전이라면 자막은 아래에 붙어 있는다.

@@ -21,16 +21,32 @@ public typealias TranslateFunction = @Sendable (String, CaptionLanguage, Caption
 public final class Translator {
     private let table: LanguageTable
     private let translate: TranslateFunction
-    private var pending: Task<Void, Never>?
-    private var generation: UInt64 = 0
     private struct SubmissionKey: Equatable {
-        let captionID: UUID
         let text: String
         let sourceID: String
         let targetID: String
         let isFinal: Bool
     }
-    private var lastSubmission: SubmissionKey?
+
+    /// 자막 한 줄의 진행 상태. **줄마다 따로** 들고 있는 게 핵심이다.
+    ///
+    /// 예전에는 `pending`/`generation`/`lastSubmission` 이 번역기 전체에 하나씩이었다.
+    /// 자막이 한 줄이던 시절엔 맞았지만, 목록 UI에서 옛 발화의 뒤늦은 final을 다시
+    /// 제출하게 되자(`CaptionState.apply`) 그 제출이 **방금 사용자가 말한 줄**의 진행 중
+    /// 번역을 취소해버렸다. 말을 마치고 잠시 쉬면 그 줄은 영영 번역 없이 남는다 —
+    /// 화자가 읽으라고 멈추는 바로 그 순간에 터지는 흔한 경로다.
+    private struct Line {
+        let captionID: UUID
+        var ticket: UInt64 = 0
+        var pending: Task<Void, Never>?
+        var lastSubmission: SubmissionKey?
+    }
+
+    /// 삽입 순서 배열. 조회와 퇴출을 같이 하고 상한이 작아 선형 탐색으로 충분하다.
+    private var lines: [Line] = []
+    /// 화면에 남을 수 있는 최대 줄 수(`Settings` 가 1...10으로 clamp 한다) + 여유.
+    /// 긴 세션에서 무한히 자라지 않게 하고, 밀려나는 줄의 작업은 그때 취소한다.
+    static let lineLimit = Settings.captionHistoryCountRange.upperBound + 4
     private var refinedIDs: [UUID] = []
     private var recentFinals: [String] = []
 
@@ -68,13 +84,35 @@ public final class Translator {
         }
     }
 
+    /// 전부 취소하고 줄별 상태를 통째로 버린다. 언어쌍 변경·보정기 교체처럼
+    /// 화면의 모든 번역이 한꺼번에 무의미해지는 경우에만 부른다.
     public func reset() {
-        generation &+= 1
-        pending?.cancel()
-        pending = nil
-        lastSubmission = nil
+        for line in lines { line.pending?.cancel() }
+        lines.removeAll()
         refinedIDs.removeAll()
         recentFinals.removeAll()
+    }
+
+    /// 해당 줄의 진행 중 작업만 끊는다.
+    private func cancelLine(_ captionID: UUID) {
+        guard let i = lines.firstIndex(where: { $0.captionID == captionID }) else { return }
+        lines[i].pending?.cancel()
+        lines[i].pending = nil
+        lines[i].lastSubmission = nil
+        lines[i].ticket &+= 1
+    }
+
+    /// 줄의 자리를 찾고, 없으면 만든다. 상한을 넘으면 가장 오래된 줄부터 퇴출하고
+    /// 그 줄의 진행 중 작업은 취소한다 — 화면에 없는 줄의 번역은 갈 데가 없다.
+    private func lineIndex(for captionID: UUID) -> Int {
+        if let i = lines.firstIndex(where: { $0.captionID == captionID }) { return i }
+        lines.append(Line(captionID: captionID))
+        if lines.count > Self.lineLimit {
+            let excess = lines.count - Self.lineLimit
+            for evicted in lines.prefix(excess) { evicted.pending?.cancel() }
+            lines.removeFirst(excess)
+        }
+        return lines.count - 1
     }
 
     /// UI 이벤트에서 직접 호출한다. Task로 감싸기 전에 이전 요청을 무효화해야 한다.
@@ -84,17 +122,23 @@ public final class Translator {
                        captionID: UUID) -> Task<Void, Never>? {
         guard let target = table.target(for: source, preferredID: preferredTargetID),
               !transcript.text.isEmpty else {
-            reset()
+            // 번역할 게 없다. 이 줄만 끊는다 — 여기서 reset()을 부르면 다른 줄의
+            // 진행 중 번역까지 날아가고, 그게 바로 이 구조가 고친 결함이다.
+            cancelLine(captionID)
             return nil
         }
-        let key = SubmissionKey(captionID: captionID, text: transcript.text,
-                                sourceID: source.id, targetID: target.id, isFinal: transcript.isFinal)
-        if key == lastSubmission { return pending } // 중복 final로 진행 중 보정까지 취소하지 않는다
-        lastSubmission = key
-        generation &+= 1
-        let ticket = generation
-        pending?.cancel()
-        pending = nil
+        let key = SubmissionKey(text: transcript.text, sourceID: source.id,
+                                targetID: target.id, isFinal: transcript.isFinal)
+        let index = lineIndex(for: captionID)
+        // 중복 final로 진행 중 보정까지 취소하지 않는다. 판단은 **그 줄 안에서만** 한다 —
+        // 전역으로 보면 A줄 제출이 똑같이 생긴 B줄 제출을 억눌러버린다.
+        if lines[index].lastSubmission == key { return lines[index].pending }
+        lines[index].lastSubmission = key
+        lines[index].ticket &+= 1
+        let ticket = lines[index].ticket
+        // 취소도 그 줄에만. 다른 줄의 진행 중 번역은 건드리지 않는다.
+        lines[index].pending?.cancel()
+        lines[index].pending = nil
         let text = transcript.text
         let task = Task { [weak self] in
             guard let self else { return }
@@ -102,11 +146,11 @@ public final class Translator {
                 do { try await Task.sleep(for: .milliseconds(220)) }
                 catch { return }
             }
-            guard self.isCurrent(ticket) else { return }
+            guard self.isCurrent(ticket, for: captionID) else { return }
             await self.emit(text, from: source, to: target, isFinal: transcript.isFinal,
                             captionID: captionID, ticket: ticket)
         }
-        pending = task
+        lines[index].pending = task
         return task
     }
 
@@ -117,17 +161,20 @@ public final class Translator {
         await task?.value
     }
 
-    private func isCurrent(_ ticket: UInt64) -> Bool {
-        ticket == generation && !Task.isCancelled
+    /// 응답이 아직 유효한가 — **자기 줄의** 최신 제출인지로만 판단한다.
+    /// 줄이 퇴출됐거나 reset 됐으면 자리가 없으므로 자연히 무효다.
+    private func isCurrent(_ ticket: UInt64, for captionID: UUID) -> Bool {
+        guard let line = lines.first(where: { $0.captionID == captionID }) else { return false }
+        return line.ticket == ticket && !Task.isCancelled
     }
 
     private func emit(_ text: String, from source: CaptionLanguage,
                       to target: CaptionLanguage, isFinal: Bool,
                       captionID: UUID, ticket: UInt64) async {
         guard let draft = await translate(text, source, target),
-              isCurrent(ticket) else { return }
+              isCurrent(ticket, for: captionID) else { return }
         onTranslation?(draft, false, captionID)
-        guard isCurrent(ticket), isFinal, !refinedIDs.contains(captionID) else { return }
+        guard isCurrent(ticket, for: captionID), isFinal, !refinedIDs.contains(captionID) else { return }
         let context = recentFinals // 현재 문장을 '직전 문장들'에 중복해서 넣지 않는다
         recentFinals.append(text)
         if recentFinals.count > 3 { recentFinals.removeFirst() }
@@ -136,7 +183,7 @@ public final class Translator {
         if refinedIDs.count > 256 { refinedIDs.removeFirst() }
         guard let improved = try? await refiner.refine(
             draft, source: text, context: context),
-              isCurrent(ticket), !improved.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+              isCurrent(ticket, for: captionID), !improved.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
               improved != draft
         else { return }
         onTranslation?(improved, true, captionID)
