@@ -4,12 +4,18 @@ public enum AudioSourceError: LocalizedError {
     case noInput
     case permissionDenied
     case noDisplay
+    /// 첫 오디오 버퍼가 제한 시간 안에 도착하지 않았다(재생 중인 소리가 없거나 무음).
+    case captureTimedOut
+    /// CMSampleBuffer → AVAudioPCMBuffer 변환에 실패했다. 조용히 버리지 않고 실행 오류로 알린다.
+    case captureFailed(String)
 
     public var errorDescription: String? {
         switch self {
         case .noInput: "마이크 입력을 찾지 못했습니다"
         case .permissionDenied: "권한이 거부되었습니다"
         case .noDisplay: "캡처할 디스플레이를 찾지 못했습니다"
+        case .captureTimedOut: "오디오 입력을 기다리다 중단했습니다. 재생 후 다시 시작하세요"
+        case .captureFailed(let reason): "오디오 캡처 처리에 실패했습니다: \(reason)"
         }
     }
 }

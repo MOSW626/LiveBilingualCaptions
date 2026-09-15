@@ -44,6 +44,8 @@ public final class CaptionState {
     public var languageTitle = CaptionLanguage.korean.displayName
     public var sourceLanguage: CaptionLanguage = .korean
     public var targetLanguage: CaptionLanguage = .english
+    /// 오디오 소스 버튼 제목. "마이크" / "시스템 오디오".
+    public var audioSourceName = AudioSourceKind.microphone.displayName
 
     @ObservationIgnored private var latest = LatestCaption()
     /// 파이프라인의 Int `utteranceID` → 그 발화가 받은 줄의 UUID.

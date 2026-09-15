@@ -7,7 +7,12 @@ import CaptionsCore
 final class AppDelegate: NSObject, NSApplicationDelegate {
     private var panel: NSPanel!
     private let state = CaptionState()
-    private let controller = PipelineController(pipeline: SpeechPipeline())
+    private let controller = PipelineController(pipeline: SpeechPipeline(makeSource: { kind in
+        switch kind {
+        case .microphone: MicSource()
+        case .systemAudio: SystemAudioSource()
+        }
+    }))
     private let translator = Translator(table: .default)
     private var settings = Settings.default
     private var running = false
@@ -51,6 +56,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private func applyStoredSettings() {
         settings = Settings.load(from: .standard)
         audioSourceKind = settings.audioSource
+        state.audioSourceName = audioSourceKind.displayName
         sensitivity = settings.detectorSensitivity
         captionHoldSeconds = settings.captionHoldSeconds
         state.fontSize = settings.fontSize
@@ -173,6 +179,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             onToggle: { [weak self] in self?.toggleListening() },
             onClear: { [weak self] in self?.clearCaptions() },
             onCycleLanguage: { [weak self] in self?.cycleLanguage() },
+            onCycleAudioSource: { [weak self] in self?.cycleAudioSource() },
             onQuit: { [weak self] in self?.quitApp() },
             onHeight: { [weak self] height in self?.fitPanel(toContentHeight: height) })
         let hosting = NSHostingView(rootView: overlay)
@@ -250,6 +257,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
         if running {
             translator.reset() // 언어쌍이 바뀌므로 진행 중이던 번역·보정은 무효화한다.
+            controller.requestReconfigure(configuration: currentConfiguration)
+        }
+    }
+
+    /// 마이크/시스템 오디오 전환도 언어 전환과 같은 경로를 탄다 — `currentConfiguration`
+    /// 스냅샷을 바꾸고 controller에 재구성을 요청한다. 소스 변경은 모듈 구성 자체가
+    /// 달라지므로(PipelineController 참고) 항상 재시작이다.
+    private func cycleAudioSource() {
+        audioSourceKind = audioSourceKind == .microphone ? .systemAudio : .microphone
+        state.audioSourceName = audioSourceKind.displayName
+        if running {
+            translator.reset()
             controller.requestReconfigure(configuration: currentConfiguration)
         }
     }

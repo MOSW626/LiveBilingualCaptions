@@ -7,6 +7,7 @@ struct CaptionOverlay: View {
     var onToggle: () -> Void
     var onClear: () -> Void
     var onCycleLanguage: () -> Void
+    var onCycleAudioSource: () -> Void
     var onQuit: () -> Void
     /// 내용 높이를 창에게 알린다. 자막이 쌓이면 창이 위로 자라야 한다.
     var onHeight: (CGFloat) -> Void
@@ -48,6 +49,7 @@ struct CaptionOverlay: View {
                     .font(.system(size: 12, weight: .medium))
                     .foregroundStyle(.white.opacity(0.52))
                 Spacer()
+                Button(state.audioSourceName, action: onCycleAudioSource)
                 Button(state.languageTitle, action: onCycleLanguage)
                 Button(state.toggleTitle, action: onToggle)
                     .disabled(!state.canToggle)
