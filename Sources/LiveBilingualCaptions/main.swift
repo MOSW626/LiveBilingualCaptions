@@ -13,12 +13,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private let quitButton = NSButton(title: "종료", target: nil, action: nil)
     private let languageButton = NSButton(title: "자동", target: nil, action: nil)
     private let controller = PipelineController(pipeline: SpeechPipeline())
+    private let translator = Translator(table: .default)
     private var running = false
-    private var translateWork: DispatchWorkItem?
-    private var pendingTranslationText = ""
-    private var lastTranslationStartedAt = Date.distantPast
     private var clearWork: DispatchWorkItem?
-    private var lastTranslatedSource = ""
+    /// 발화 ID는 파이프라인이 매기는 Int(`TranscriptEvent.utteranceID`)이지만 Translator는
+    /// 자막 목록(Task 7)을 염두에 두고 UUID를 쓴다. 여기서 Int → UUID로 다리를 놓는다.
+    /// 같은 utteranceID가 이어지는 동안(부분 → 확정 갱신)은 같은 UUID를 유지한다.
+    private var currentUtteranceID: Int?
+    private var currentCaptionID = UUID()
     /// 자동 모드는 실험 기능이다. 최초 언어는 한국어, 고정 모드는 저장한 ID를 쓴다.
     private var languageMode: LanguageMode = .fixed(CaptionLanguage.korean.id)
     private var currentLanguage: CaptionLanguage = .korean
@@ -42,6 +44,33 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         applyStoredSettings()
         controller.onState = { [weak self] state in self?.apply(state) }
         controller.onEvent = { [weak self] event in self?.handle(event) }
+        translator.onTranslation = { [weak self] text, refined, captionID in
+            guard let self, captionID == self.currentCaptionID else { return } // 늦게 온 응답 폐기
+            if refined {
+                NSAnimationContext.runAnimationGroup { ctx in
+                    ctx.duration = 0.2
+                    self.translatedLabel.animator().alphaValue = 0
+                } completionHandler: {
+                    // 애니메이션이 도는 동안 표시된 발화가 바뀌었을 수 있다 — 다시 검사한다.
+                    guard captionID == self.currentCaptionID else { return }
+                    self.translatedLabel.stringValue = text
+                    self.translatedLabel.animator().alphaValue = 1
+                }
+            } else {
+                self.translatedLabel.stringValue = text
+            }
+        }
+    }
+
+    /// 파이프라인의 Int `utteranceID`를 Translator의 UUID `captionID`로 바꾼다.
+    /// 같은 발화(같은 utteranceID)가 이어지는 동안에는 같은 UUID를 유지해서
+    /// 부분→확정 갱신이 같은 줄로 취급되게 한다. 발화가 바뀌면 새 UUID를 발급한다.
+    private func captionID(for utteranceID: Int) -> UUID {
+        if utteranceID != currentUtteranceID {
+            currentUtteranceID = utteranceID
+            currentCaptionID = UUID()
+        }
+        return currentCaptionID
     }
 
     /// 저장된 설정에서 언어·소스·민감도를 읽어 온다. 고정 모드의 ID가 곧 시작 언어이고,
@@ -105,9 +134,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private func show(_ event: TranscriptEvent) {
         // 옛 발화의 뒤늦은 final이 최신 원문을 되돌리지 않게 발화 ID로 거른다.
         guard let text = latestCaption.apply(event) else { return }
+        let captionID = captionID(for: event.utteranceID)
         let displayed = CaptionText.tail(text)
         originalLabel.stringValue = displayed
-        scheduleTranslation(of: event.transcript)
+        // 원문을 갱신할 때 이전 번역 표시도 비우고 새 요청을 등록한다.
+        translatedLabel.stringValue = ""
+        translator.submit(event.transcript, from: event.sourceLanguage, captionID: captionID)
         // 말이 이어지는 동안에는 지우기 타이머를 계속 뒤로 민다.
         scheduleCaptionClear()
 
@@ -117,6 +149,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     /// 자동 전환은 실험 기능이다. 제안만 하고 실행은 반드시 controller를 거친다.
+    ///
+    /// 여기서 translator.reset()을 부르지 않는다: 이 함수는 방금 이 이벤트에 대해
+    /// submit()이 이미 끝난 뒤에 호출된다(위 show() 참고). 그 submit은 이벤트에 고정된
+    /// event.sourceLanguage를 썼으므로 이미 올바르다 — reset()을 부르면 방금 막 등록한
+    /// 정당한 번역 요청 자체를 취소해버린다. currentLanguage는 다음 발화의 인식 엔진
+    /// 설정에만 영향을 주고, 다음 발화는 어차피 새 captionID로 새 submit()을 타므로
+    /// 이전 세대는 자연히 무효화된다.
     private func proposeAutomaticLanguage(for text: String) {
         let detected = LanguageTable.default.detect(text, current: currentLanguage)
         guard detected != currentLanguage else { return }
@@ -245,15 +284,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     /// 진행 중인 번역 작업과 clear 타이머를 취소한다.
-    /// Task 6에서 여기에 translator.reset()과 번역 세대 무효화가 붙는다.
     private func invalidateCaptions() {
         clearWork?.cancel()
         clearWork = nil
-        translateWork?.cancel()
-        translateWork = nil
-        pendingTranslationText = ""
-        lastTranslatedSource = ""
+        translator.reset()
         latestCaption.reset()
+        currentUtteranceID = nil
     }
 
     @objc private func quitApp() {
@@ -276,6 +312,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
         languageButton.title = languageButtonTitle
         if running {
+            translator.reset() // 언어쌍이 바뀌므로 진행 중이던 번역·보정은 무효화한다.
             controller.requestReconfigure(configuration: currentConfiguration)
         }
     }
@@ -305,25 +342,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         statusLabel.stringValue = "● 듣는 중 · \(mode)"
     }
 
-    /// Task 6에서 `Transcript`를 그대로 쓰는 구현으로 교체한다. 지금은 문자열만 넘긴다.
-    private func scheduleTranslation(of transcript: Transcript) {
-        let text = transcript.text
-        guard text != lastTranslatedSource else { return }
-        pendingTranslationText = text
-        guard translateWork == nil else { return }
-        let elapsed = Date().timeIntervalSince(lastTranslationStartedAt)
-        let delay = max(0, 0.22 - elapsed)
-        let work = DispatchWorkItem { [weak self] in
-            guard let self else { return }
-            self.translateWork = nil
-            let current = self.pendingTranslationText
-            self.lastTranslationStartedAt = Date()
-            self.translate(current)
-        }
-        translateWork = work
-        DispatchQueue.main.asyncAfter(deadline: .now() + delay, execute: work)
-    }
-
     private func scheduleCaptionClear() {
         clearWork?.cancel()
         let work = DispatchWorkItem { [weak self] in
@@ -337,39 +355,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 self.translatedLabel.stringValue = ""
                 self.originalLabel.alphaValue = 1
                 self.translatedLabel.alphaValue = 1
-                self.lastTranslatedSource = ""
+                self.translator.reset() // 유지 시간 만료로 자막을 비운다 — 대기 중이던 번역도 무효화.
                 self.latestCaption.reset()
+                self.currentUtteranceID = nil
             }
         }
         clearWork = work
         // 발화마다 지우지 않는다. 침묵이 captionHoldSeconds 만큼 이어진 뒤에만 비운다.
         DispatchQueue.main.asyncAfter(deadline: .now() + captionHoldSeconds, execute: work)
-    }
-
-    private func translate(_ text: String) {
-        let hasKorean = text.unicodeScalars.contains { (0xAC00...0xD7A3).contains(Int($0.value)) }
-        let target = hasKorean ? "en" : "ko"
-        var components = URLComponents(string: "https://translate.googleapis.com/translate_a/single")!
-        components.queryItems = [
-            URLQueryItem(name: "client", value: "gtx"), URLQueryItem(name: "sl", value: "auto"),
-            URLQueryItem(name: "tl", value: target), URLQueryItem(name: "dt", value: "t"),
-            URLQueryItem(name: "q", value: text)
-        ]
-        guard let url = components.url else { return }
-        URLSession.shared.dataTask(with: url) { [weak self] data, _, _ in
-            guard let data,
-                  let json = try? JSONSerialization.jsonObject(with: data) as? [Any],
-                  let blocks = json.first as? [Any] else { return }
-            let translated = blocks.compactMap { ($0 as? [Any])?.first as? String }.joined()
-            DispatchQueue.main.async {
-                guard !translated.isEmpty, self?.originalLabel.stringValue == text else { return }
-                self?.lastTranslatedSource = text
-                self?.translatedLabel.stringValue = translated
-                if let pending = self?.pendingTranslationText, pending != text {
-                    self?.scheduleTranslation(of: .partial(pending))
-                }
-            }
-        }.resume()
     }
 
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool { true }
