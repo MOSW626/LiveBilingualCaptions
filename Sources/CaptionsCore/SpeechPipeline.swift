@@ -353,6 +353,9 @@ public protocol SpeechSession: Sendable {
     /// 협상된 포맷으로 분석을 시작하고 결과 스트림을 돌려준다.
     func start(format: AVAudioFormat, input: AudioInputQueue) async throws -> AsyncThrowingStream<TranscriptionChunk, any Error>
     /// 포맷이 호환되면 모듈만 갈아끼우고 true. 아니면 false — 호출자가 재시작한다.
+    ///
+    /// 교체 **전에** 진행 중인 오디오를 확정하고 그 결과를 결과 스트림으로 내보내야
+    /// 한다. 그냥 갈아끼우면 사용자가 말하던 문장이 final 없이 사라진다.
     func setLanguage(_ locale: Locale) async throws -> Bool
     func finish() async
 }
@@ -438,13 +441,18 @@ public final class SpeechPipeline {
         guard let run = current, run.listening, let session = run.session else { return false }
         guard let locale = await engine.supportedLocale(equivalentTo: language.locale) else { return false }
         guard current === run else { return false }
+
+        // 교체를 시작하기 전에 실행 ID를 최신 generation으로 올린다. 세션이 교체 직전에
+        // 확정해 내보내는 마지막 문장이 controller의 generation 필터에 걸려 사라지지
+        // 않도록 — 그 문장이야말로 사용자가 방금 말한, 잃으면 안 되는 문장이다.
+        // 언어는 교체가 성공한 **뒤에** 바꾼다. 그 마지막 문장은 아직 이전 언어다.
+        run.id = generation
         guard let swapped = try? await session.setLanguage(locale), swapped else { return false }
         guard current === run else { return false }
 
         await reserveIfNeeded(locale, run: run)
         guard current === run else { return false }
 
-        run.id = generation
         run.configuration.language = language
         run.language = language
         run.ledger.breakUtterance()
@@ -647,6 +655,8 @@ actor SystemSpeechSession: SpeechSession {
     private var analysisFormat: AVAudioFormat?
     private var analysisTask: Task<Void, Never>?
     private var pumpTask: Task<Void, Never>?
+    /// 언어 교체 직전까지 돌던 pump. 확정된 마지막 결과를 마저 실어 나른다.
+    private var retiredPump: Task<Void, Never>?
     private var continuation: AsyncThrowingStream<TranscriptionChunk, any Error>.Continuation?
 
     init(locale: Locale, sensitivity: DetectorSensitivity) {
@@ -718,8 +728,21 @@ actor SystemSpeechSession: SpeechSession {
               format.isInterleaved == analysisFormat.isInterleaved
         else { return false }
 
-        pumpTask?.cancel()
+        // 1) 이미 먹인 오디오를 먼저 확정한다. 이걸 건너뛰고 모듈만 갈아끼우면 사용자가
+        //    방금 말하던 문장이 final 없이 사라진다 — 자막이 말 없이 증발하는 것은 이
+        //    앱에서 가장 민감한 실패다. 분석기 자체는 끝내지 않는다(사용자가 누른
+        //    정지가 아니다). 사용자 정지 경로는 그대로 cancelAndFinishNow를 쓴다.
+        try? await analyzer.finalize(through: nil)
+
+        // 2) 모듈 교체. 빠진 모듈의 결과 스트림은 여기서 끝나므로 옛 pump는 스스로
+        //    빠져나온다. pump를 먼저 취소하면 방금 확정한 결과를 그 pump가 버린다.
         try await analyzer.setModules(newModules)
+
+        // 3) 옛 pump는 남은 결과(특히 방금의 final)를 같은 continuation으로 실어 나른
+        //    뒤에 끝난다. 스트림이 끝나지 않는 구현이어도 태스크가 무한히 쌓이지 않도록
+        //    직전에 은퇴시킨 것 하나만 남기고 정리한다.
+        retiredPump?.cancel()
+        retiredPump = pumpTask
         transcriber = candidate
         locale = newLocale
         startPump()
@@ -727,6 +750,7 @@ actor SystemSpeechSession: SpeechSession {
     }
 
     func finish() async {
+        retiredPump?.cancel(); retiredPump = nil
         pumpTask?.cancel(); pumpTask = nil
         analysisTask?.cancel(); analysisTask = nil
         continuation?.finish(); continuation = nil
