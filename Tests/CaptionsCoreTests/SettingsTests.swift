@@ -17,6 +17,7 @@ private func freshDefaults(_ name: String) -> UserDefaults {
     settings.captionHoldSeconds = 4.5
     settings.detectorSensitivity = .high
     settings.refinementEnabled = true
+    settings.captionHistoryCount = 5
     settings.panelOriginX = 120
     settings.panelOriginY = 64
     settings.preferredTargetID = "en-US"
@@ -38,13 +39,24 @@ private func freshDefaults(_ name: String) -> UserDefaults {
     #expect(Settings.load(from: defaults) == Settings.default)
 }
 
+@Test func 디코드에_실패하는_Data도_기본값으로_복구() {
+    // 위 테스트는 String 값을 넣어 `data(forKey:)` 가 nil을 돌려주는 분기만 지난다.
+    // 여기서는 실제 Data를 넣되 Settings로 디코드할 수 없는 내용으로 만들어
+    // `try? JSONDecoder().decode(...)` 가 nil을 돌려주는 분기를 지나게 한다.
+    let defaults = freshDefaults("test.undecodable")
+    defaults.set(Data("{ this is not valid json".utf8), forKey: Settings.storageKey)
+    #expect(Settings.load(from: defaults) == Settings.default)
+}
+
 @Test func 기본값은_LLM_보정이_꺼져_있다() {
     #expect(Settings.default.refinementEnabled == false)
 }
 
 @Test func 새_optional_필드가_없는_옛_JSON도_기존_값을_보존하며_읽힌다() {
     let defaults = freshDefaults("test.legacy")
-    // preferredTargetID, panelWidth, panelHeight 가 없는 구버전 JSON을 손으로 만든다.
+    // preferredTargetID, panelWidth, panelHeight 뿐 아니라 captionHistoryCount(non-optional로
+    // 나중에 추가된 필드)도 없는 구버전 JSON을 손으로 만든다. 새 필드 하나가 옛 설정을
+    // 통째로 날려서는 안 된다.
     let legacyJSON = """
     {
         "languageMode": { "fixed": { "_0": "ja-JP" } },
@@ -67,4 +79,5 @@ private func freshDefaults(_ name: String) -> UserDefaults {
     #expect(loaded.preferredTargetID == nil)
     #expect(loaded.panelWidth == nil)
     #expect(loaded.panelHeight == nil)
+    #expect(loaded.captionHistoryCount == Settings.defaultCaptionHistoryCount)
 }
