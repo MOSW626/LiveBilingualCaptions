@@ -6,6 +6,11 @@ macOS 26 전용 실시간 양국어 자막 오버레이. 본인 맥 전용(배�
 - 빌드+실행: `./run.sh`
 - 빌드만: `./build.sh` → `dist/Live Bilingual Captions.app`
 - 테스트: `./test.sh` (**맨 `swift test` 는 실패한다** — swift-testing 경로 플래그 필요)
+- 런치 크래시 확인: `./smoke.sh` — 빌드하고 번들 실행 파일을 직접 띄워 15초 생존을
+  확인한다. **유닛 테스트는 실행 시점 액터 격리 트랩(MainActor 클로저가 realtime
+  오디오 스레드 등 다른 스레드에서 불려 SIGTRAP 나는 것)을 잡지 못한다** — 프로세스를
+  실제로 띄우지 않기 때문이다. 오디오 캡처 콜백, 스레드 전환 배선을 건드렸다면
+  `./test.sh` 가 통과해도 반드시 이것도 돌릴 것.
 
 ## 환경 제약
 - 전체 Xcode 없음 → **XCTest 사용 불가.** swift-testing 전용.

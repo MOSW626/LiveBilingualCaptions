@@ -43,9 +43,16 @@ public final class MicSource: AudioSource {
         guard format.sampleRate > 0 else { throw AudioSourceError.noInput }
 
         input.removeTap(onBus: 0)
-        input.installTap(onBus: 0, bufferSize: 4096, format: format) { buffer, _ in
+        // installTap의 블록은 인라인으로 쓰면 감싸는 @MainActor start(_:)의 격리를 물려받는다
+        // (블록 타입 자체는 @Sendable이 아니라서 추론이 컨텍스트를 따라간다). AVAudioEngine은
+        // 이 블록을 realtime 오디오 스레드에서 부르므로, MainActor로 격리된 채로 불리면
+        // 런타임에 executor assert가 터진다(SIGTRAP). 명시적 @Sendable 타입 지역 변수에
+        // 먼저 담아서 바인딩하면 MainActor를 물려받지 않고, sink 하나만 캡처한다 — self도,
+        // 다른 MainActor 상태도 캡처하지 않는다.
+        let tapBlock: @Sendable (AVAudioPCMBuffer, AVAudioTime) -> Void = { buffer, _ in
             sink(buffer)
         }
+        input.installTap(onBus: 0, bufferSize: 4096, format: format, block: tapBlock)
         engine.prepare()
         do { try engine.start() }
         catch {
