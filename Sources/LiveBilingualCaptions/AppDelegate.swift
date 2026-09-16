@@ -31,6 +31,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var resizeObserver: NSObjectProtocol?
     private var running = false
     private var clearTask: Task<Void, Never>?
+    /// 자막은 지연에 민감하다 — 가장 빠른 Haiku 계열을 쓴다. 날짜 접미사를 붙이지 않는다.
+    private let refinerModel = "claude-haiku-4-5"
     /// 마지막으로 자막이 갱신된 시각. 유지 시간 설정이 바뀌었을 때 "얼마나 지났는지"를
     /// 계산하는 기준이다. 지울 자막이 없으면(타이머가 없으면) nil이다.
     private var lastCaptionUpdate: Date?
@@ -49,6 +51,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         applyStoredSettings()
+        updateRefiner()
         buildWindow()
         buildStatusItem()
         bindController()
@@ -150,6 +153,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         state.audioSourceName = new.audioSource.displayName
         translator.preferredTargetID = new.preferredTargetID
         syncLanguage() // preferredTargetID만 바뀌어도 대상 언어가 달라질 수 있다
+        if old.refinementEnabled != new.refinementEnabled { updateRefiner() }
 
         let result = applySettingsChange(old: old, new: new, running: running,
                                          configuration: currentConfiguration, controller: controller)
@@ -163,6 +167,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             rescheduleCaptionClear()
         }
         return result.didReconfigure
+    }
+
+    /// 보정 토글·키 저장 성공 시에만 부른다. 폰트 크기 같은 무관한 변경에는 부르지 않는다 —
+    /// `Translator.refiner`의 didSet이 진행 중인 보정 작업을 매번 취소하기 때문이다.
+    private func updateRefiner() {
+        guard settingsStore.value.refinementEnabled,
+              let key = KeychainStore.read(account: KeychainStore.apiKeyAccount),
+              !key.isEmpty else {
+            translator.refiner = nil
+            return
+        }
+        translator.refiner = ClaudeRefiner(apiKey: key, model: refinerModel)
     }
 
     /// 음성 locale 지원 여부와 번역의 방향별 상태를 조회해 설정 창의 비활성/다운로드 안내를
@@ -245,7 +261,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let view = SettingsView(
             settings: Binding(get: { self.settingsStore.value }, set: { self.apply($0) }),
             table: .default,
-            availability: availability)
+            availability: availability,
+            onAPIKeySaved: { [weak self] in self?.updateRefiner() })
         let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 420, height: 480),
                               styleMask: [.titled, .closable], backing: .buffered, defer: false)
         window.title = "Live Bilingual Captions 설정"

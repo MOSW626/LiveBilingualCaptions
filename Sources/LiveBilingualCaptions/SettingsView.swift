@@ -8,6 +8,12 @@ struct SettingsView: View {
     @Binding var settings: CaptionsCore.Settings
     var table: LanguageTable
     var availability: LanguageAvailabilityState
+    /// 키 저장 성공 시 AppDelegate 가 번역기의 보정기를 다시 연결하도록 알린다.
+    /// 토글을 켠 뒤 처음 키를 저장하는 순간에도(재토글·재실행 없이) 반영되려면 필요하다.
+    var onAPIKeySaved: () -> Void
+
+    @State private var apiKey = KeychainStore.read(account: KeychainStore.apiKeyAccount) ?? ""
+    @State private var keySaveStatus = ""
 
     var body: some View {
         Form {
@@ -62,11 +68,39 @@ struct SettingsView: View {
                     Text("표시 개수 \(settings.captionHistoryCount)줄")
                 }
             }
-            // "번역 보정" 섹션은 Task 10이 추가한다. updateRefiner()가 아직 없으므로
-            // 여기서 토글을 노출하면 동작하지 않는 스위치가 되고 apply()가 컴파일되지 않는다.
+            Section("번역 보정") {
+                Toggle("Claude 로 확정 문장 다듬기", isOn: $settings.refinementEnabled)
+                Text("켜면 확정된 문장만 인터넷으로 전송됩니다. 끄면 모든 처리가 기기 안에서 끝납니다.")
+                    .font(.caption).foregroundStyle(.secondary)
+                if settings.refinementEnabled {
+                    SecureField("Anthropic API 키", text: $apiKey)
+                        .onSubmit { saveAPIKey() }
+                    Button("키 저장", action: saveAPIKey)
+                    if !keySaveStatus.isEmpty {
+                        Text(keySaveStatus)
+                            .font(.caption).foregroundStyle(.secondary)
+                    }
+                    Text("키는 Keychain 에 저장됩니다.")
+                        .font(.caption).foregroundStyle(.secondary)
+                }
+            }
         }
         .formStyle(.grouped)
         .frame(width: 420)
+    }
+
+    private func saveAPIKey() {
+        let value = apiKey.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !value.isEmpty else {
+            keySaveStatus = "API 키를 입력하세요"
+            return
+        }
+        guard KeychainStore.save(value, account: KeychainStore.apiKeyAccount) else {
+            keySaveStatus = "키를 저장하지 못했습니다"
+            return
+        }
+        keySaveStatus = "키를 저장했습니다"
+        onAPIKeySaved() // 저장에 성공했을 때만 보정기를 갱신한다
     }
 
     private var languageSelection: Binding<String> {
