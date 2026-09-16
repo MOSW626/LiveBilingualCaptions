@@ -22,7 +22,6 @@ private func freshDefaults(_ name: String) -> UserDefaults {
     settings.panelOriginY = 64
     settings.preferredTargetID = "en-US"
     settings.panelWidth = 720
-    settings.panelHeight = 240
 
     settings.save(to: defaults)
     #expect(Settings.load(from: defaults) == settings)
@@ -54,9 +53,10 @@ private func freshDefaults(_ name: String) -> UserDefaults {
 
 @Test func 새_optional_필드가_없는_옛_JSON도_기존_값을_보존하며_읽힌다() {
     let defaults = freshDefaults("test.legacy")
-    // preferredTargetID, panelWidth, panelHeight 뿐 아니라 captionHistoryCount(non-optional로
-    // 나중에 추가된 필드)도 없는 구버전 JSON을 손으로 만든다. 새 필드 하나가 옛 설정을
-    // 통째로 날려서는 안 된다.
+    // preferredTargetID, panelWidth 뿐 아니라 captionHistoryCount(non-optional로 나중에
+    // 추가된 필드)도 없는 구버전 JSON을 손으로 만든다. 새 필드 하나가 옛 설정을 통째로
+    // 날려서는 안 된다. panelHeight는 반대로, 더 이상 쓰지 않는 필드가 남아 있는 옛
+    // JSON — CodingKeys에서 빠졌다고 디코드가 깨지면 안 된다.
     let legacyJSON = """
     {
         "languageMode": { "fixed": { "_0": "ja-JP" } },
@@ -64,7 +64,8 @@ private func freshDefaults(_ name: String) -> UserDefaults {
         "fontSize": 24,
         "captionHoldSeconds": 6,
         "detectorSensitivity": "low",
-        "refinementEnabled": true
+        "refinementEnabled": true,
+        "panelHeight": 240
     }
     """
     defaults.set(Data(legacyJSON.utf8), forKey: Settings.storageKey)
@@ -78,6 +79,5 @@ private func freshDefaults(_ name: String) -> UserDefaults {
     #expect(loaded.refinementEnabled == true)
     #expect(loaded.preferredTargetID == nil)
     #expect(loaded.panelWidth == nil)
-    #expect(loaded.panelHeight == nil)
     #expect(loaded.captionHistoryCount == Settings.defaultCaptionHistoryCount)
 }

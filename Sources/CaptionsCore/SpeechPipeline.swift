@@ -33,16 +33,14 @@ public struct PipelineConfiguration: Sendable, Equatable {
 /// 이미 나간 이벤트의 번역 대상은 흔들리지 않는다.
 public struct TranscriptEvent: Sendable, Equatable {
     public let utteranceID: Int
-    public let revision: Int
     public let sourceLanguage: CaptionLanguage
     public let transcript: Transcript
 
     public var text: String { transcript.text }
     public var isFinal: Bool { transcript.isFinal }
 
-    public init(utteranceID: Int, revision: Int, sourceLanguage: CaptionLanguage, transcript: Transcript) {
+    public init(utteranceID: Int, sourceLanguage: CaptionLanguage, transcript: Transcript) {
         self.utteranceID = utteranceID
-        self.revision = revision
         self.sourceLanguage = sourceLanguage
         self.transcript = transcript
     }
@@ -1047,7 +1045,6 @@ public final class SpeechPipeline {
                 let transcript: Transcript = chunk.isFinal ? .final(chunk.text) : .partial(chunk.text)
                 emit(chunk.runID, .transcript(TranscriptEvent(
                     utteranceID: assignment.id,
-                    revision: assignment.revision,
                     sourceLanguage: chunk.language,
                     transcript: transcript)))
             }

@@ -939,7 +939,7 @@ let autoConfig = PipelineConfiguration(source: .microphone, language: .korean, s
     #expect(b.id == c.id) // 누적이 아니라 "직전 조각 대비" 허용치로 비교해야 한다
 }
 
-@Test @MainActor func 전사_이벤트는_실행ID_발화ID_수정번호_언어를_함께_싣는다() async {
+@Test @MainActor func 전사_이벤트는_실행ID_발화ID_언어를_함께_싣는다() async {
     let harness = Harness()
     harness.controller.requestStart(configuration: koreanConfig)
     await harness.waitUntilListening()
@@ -952,7 +952,6 @@ let autoConfig = PipelineConfiguration(source: .microphone, language: .korean, s
     let events = harness.transcripts
     #expect(events.count == 2)
     #expect(events[0].utteranceID == events[1].utteranceID)
-    #expect(events[0].revision == 0 && events[1].revision == 1)
     #expect(events.allSatisfy { $0.sourceLanguage == .korean })
     #expect(harness.events.wrapped.allSatisfy { $0.runID == harness.controller.currentGeneration })
 }

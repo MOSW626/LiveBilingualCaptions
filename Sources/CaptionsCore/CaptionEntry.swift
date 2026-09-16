@@ -8,15 +8,12 @@ public struct CaptionEntry: Identifiable, Sendable, Equatable {
     public var original: String
     public var translated: String
     public var isFinal: Bool
-    public var sourceLanguageID: String
 
-    public init(id: UUID, original: String, translated: String,
-                isFinal: Bool, sourceLanguageID: String) {
+    public init(id: UUID, original: String, translated: String, isFinal: Bool) {
         self.id = id
         self.original = original
         self.translated = translated
         self.isFinal = isFinal
-        self.sourceLanguageID = sourceLanguageID
     }
 }
 
@@ -53,7 +50,6 @@ public final class CaptionState {
     /// `CaptionSegmenter.recommendedCap`으로 다시 계산해 여기 채운다 — 문장마다
     /// 재계산하지 않는다(그 비용은 `CaptionSegmenter.recommendedCap`의 문서 참고).
     public var segmentCap = CaptionSegmenter.defaultCap
-    public var isRunning = false
     /// 시작/정지 버튼 제목. "정지 중…", "다시 시작" 같은 중간 상태까지 그대로 보여준다.
     public var toggleTitle = "시작"
     public var canToggle = true
@@ -125,8 +121,7 @@ public final class CaptionState {
             } else {
                 id = captionID(for: event.utteranceID, segmentIndex: index, runID: runID)
             }
-            upsert(id: id, original: segment.text, isFinal: segment.isComplete,
-                   sourceLanguageID: event.sourceLanguage.id)
+            upsert(id: id, original: segment.text, isFinal: segment.isComplete)
             let transcript: Transcript = segment.isComplete ? .final(segment.text) : .partial(segment.text)
             results.append(CaptionRowUpdate(id: id, transcript: transcript))
         }
@@ -150,13 +145,12 @@ public final class CaptionState {
 
     /// 같은 발화 ID면 기존 항목을 갱신하고, 새 ID면 항목을 추가한다.
     /// 발화마다 화면을 비우지 않는다 — 연속 발화 중에는 이전 자막이 남아야 한다.
-    public func upsert(id: UUID, original: String, isFinal: Bool, sourceLanguageID: String) {
+    public func upsert(id: UUID, original: String, isFinal: Bool) {
         if let i = entries.firstIndex(where: { $0.id == id }) {
             entries[i].original = original
             entries[i].isFinal = isFinal
         } else {
-            entries.append(CaptionEntry(id: id, original: original, translated: "",
-                                        isFinal: isFinal, sourceLanguageID: sourceLanguageID))
+            entries.append(CaptionEntry(id: id, original: original, translated: "", isFinal: isFinal))
         }
         trim()
     }

@@ -24,6 +24,9 @@ macOS 26 전용 실시간 양국어 자막 오버레이. 본인 맥 전용(배�
 - `CaptionsCore` — UI 없는 로직. 테스트는 전부 여기.
 - `LiveBilingualCaptions` — AppKit `NSPanel` + SwiftUI 내용.
 - 창이 `NSPanel` 인 이유: SwiftUI Scene 으로는 `.screenSaver` borderless 오버레이 불가.
+- 자동 언어 모드는 분석기·전사기·pump를 언어별로 **두 벌** 돌린다 — 실측 제약으로 `SpeechAnalyzer`
+  하나에 `SpeechTranscriber` 둘을 물리면 `setWorkers`에서 SIGTRAP 나므로, "분석기 하나 공유"로
+  단순화하면 안 된다(`SpeechPipeline.swift`).
 
 ## 코드서명 인증서 만들기 (1회, 권한 유지용)
 ad-hoc 서명은 빌드마다 cdhash 가 바뀌어 마이크·화면기록 권한이 매번 초기화된다.

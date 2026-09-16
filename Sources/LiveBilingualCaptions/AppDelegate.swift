@@ -147,7 +147,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             state.toggleTitle = "다시 시작"
             state.status = "시작 실패: \(message)"
         }
-        state.isRunning = running
         state.canToggle = true
     }
 

@@ -41,7 +41,6 @@ public struct Settings: Codable, Equatable, Sendable {
     public var panelOriginX: Double?
     public var panelOriginY: Double?
     public var panelWidth: Double?
-    public var panelHeight: Double?
 
     public static let storageKey = "settings.v1"
     public static let defaultCaptionHistoryCount = 3
@@ -58,8 +57,7 @@ public struct Settings: Codable, Equatable, Sendable {
         captionHistoryCount: defaultCaptionHistoryCount,
         panelOriginX: nil,
         panelOriginY: nil,
-        panelWidth: nil,
-        panelHeight: nil)
+        panelWidth: nil)
 
     public init(
         languageMode: LanguageMode,
@@ -72,8 +70,7 @@ public struct Settings: Codable, Equatable, Sendable {
         captionHistoryCount: Int,
         panelOriginX: Double?,
         panelOriginY: Double?,
-        panelWidth: Double?,
-        panelHeight: Double?
+        panelWidth: Double?
     ) {
         self.languageMode = languageMode
         self.preferredTargetID = preferredTargetID
@@ -86,13 +83,12 @@ public struct Settings: Codable, Equatable, Sendable {
         self.panelOriginX = panelOriginX
         self.panelOriginY = panelOriginY
         self.panelWidth = panelWidth
-        self.panelHeight = panelHeight
     }
 
     private enum CodingKeys: String, CodingKey {
         case languageMode, preferredTargetID, audioSource, fontSize, captionHoldSeconds
         case detectorSensitivity, refinementEnabled, captionHistoryCount
-        case panelOriginX, panelOriginY, panelWidth, panelHeight
+        case panelOriginX, panelOriginY, panelWidth
     }
 
     /// `captionHistoryCount`는 옛 저장값엔 없을 수 있는 non-optional 필드다 — 없으면
@@ -114,7 +110,8 @@ public struct Settings: Codable, Equatable, Sendable {
         panelOriginX = try container.decodeIfPresent(Double.self, forKey: .panelOriginX)
         panelOriginY = try container.decodeIfPresent(Double.self, forKey: .panelOriginY)
         panelWidth = try container.decodeIfPresent(Double.self, forKey: .panelWidth)
-        panelHeight = try container.decodeIfPresent(Double.self, forKey: .panelHeight)
+        // panelHeight: 더 이상 저장·노출하지 않는다. CodingKeys에 없으므로 옛 JSON에 이
+        // 키가 남아 있어도(추가 키는 무시된다) 디코드가 실패하지 않는다.
     }
 
     /// 저장된 값이 없거나 형식이 깨졌으면 기본값으로 돌아간다.

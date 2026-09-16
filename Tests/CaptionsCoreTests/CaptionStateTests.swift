@@ -8,13 +8,13 @@ import Foundation
 @Test @MainActor func 같은_발화_ID는_갱신하고_새_ID는_덧붙인다() {
     let state = CaptionState()
     let first = UUID()
-    state.upsert(id: first, original: "안녕", isFinal: false, sourceLanguageID: "ko-KR")
-    state.upsert(id: first, original: "안녕하세요", isFinal: true, sourceLanguageID: "ko-KR")
+    state.upsert(id: first, original: "안녕", isFinal: false)
+    state.upsert(id: first, original: "안녕하세요", isFinal: true)
     #expect(state.entries.count == 1)
     #expect(state.entries[0].original == "안녕하세요")
     #expect(state.entries[0].isFinal)
 
-    state.upsert(id: UUID(), original: "반갑습니다", isFinal: false, sourceLanguageID: "ko-KR")
+    state.upsert(id: UUID(), original: "반갑습니다", isFinal: false)
     #expect(state.entries.count == 2)
     #expect(state.entries[0].original == "안녕하세요") // 이전 발화가 남아 있다
     #expect(state.entries[1].original == "반갑습니다")
@@ -23,9 +23,9 @@ import Foundation
 @Test @MainActor func 갱신은_이미_붙은_번역을_지우지_않는다() {
     let state = CaptionState()
     let id = UUID()
-    state.upsert(id: id, original: "안녕", isFinal: false, sourceLanguageID: "ko-KR")
+    state.upsert(id: id, original: "안녕", isFinal: false)
     state.setTranslation("Hi", for: id)
-    state.upsert(id: id, original: "안녕하세요", isFinal: true, sourceLanguageID: "ko-KR")
+    state.upsert(id: id, original: "안녕하세요", isFinal: true)
     #expect(state.entries[0].translated == "Hi")
 }
 
@@ -33,8 +33,8 @@ import Foundation
     let state = CaptionState()
     let first = UUID()
     let second = UUID()
-    state.upsert(id: first, original: "안녕하세요", isFinal: true, sourceLanguageID: "ko-KR")
-    state.upsert(id: second, original: "반갑습니다", isFinal: true, sourceLanguageID: "ko-KR")
+    state.upsert(id: first, original: "안녕하세요", isFinal: true)
+    state.upsert(id: second, original: "반갑습니다", isFinal: true)
 
     // 늦게 도착한 첫 발화의 번역. 최신 줄이 아니라 첫 줄에 붙어야 한다.
     state.setTranslation("Hello", for: first)
@@ -51,7 +51,7 @@ import Foundation
     state.historyCount = 2
     let ids = (0..<4).map { _ in UUID() }
     for (i, id) in ids.enumerated() {
-        state.upsert(id: id, original: "발화 \(i)", isFinal: true, sourceLanguageID: "ko-KR")
+        state.upsert(id: id, original: "발화 \(i)", isFinal: true)
     }
     #expect(state.entries.map(\.original) == ["발화 2", "발화 3"])
 }
@@ -59,8 +59,8 @@ import Foundation
 @Test @MainActor func 한도가_0이하여도_최신_한_줄은_남는다() {
     let state = CaptionState()
     state.historyCount = 0
-    state.upsert(id: UUID(), original: "하나", isFinal: true, sourceLanguageID: "ko-KR")
-    state.upsert(id: UUID(), original: "둘", isFinal: true, sourceLanguageID: "ko-KR")
+    state.upsert(id: UUID(), original: "하나", isFinal: true)
+    state.upsert(id: UUID(), original: "둘", isFinal: true)
     #expect(state.entries.map(\.original) == ["둘"])
 }
 
@@ -68,8 +68,8 @@ import Foundation
     let state = CaptionState()
     state.historyCount = 1
     let evicted = UUID()
-    state.upsert(id: evicted, original: "밀려난 발화", isFinal: true, sourceLanguageID: "ko-KR")
-    state.upsert(id: UUID(), original: "최신 발화", isFinal: true, sourceLanguageID: "ko-KR")
+    state.upsert(id: evicted, original: "밀려난 발화", isFinal: true)
+    state.upsert(id: UUID(), original: "최신 발화", isFinal: true)
 
     state.setTranslation("gone", for: evicted) // 크래시가 아니라 무시여야 한다
     #expect(state.entries.count == 1)
@@ -83,7 +83,7 @@ import Foundation
 
 @Test @MainActor func 지우기는_목록을_비운다() {
     let state = CaptionState()
-    state.upsert(id: UUID(), original: "안녕", isFinal: true, sourceLanguageID: "ko-KR")
+    state.upsert(id: UUID(), original: "안녕", isFinal: true)
     #expect(!state.isEmpty)
     state.clear()
     #expect(state.isEmpty)
@@ -102,7 +102,7 @@ import Foundation
     let state = CaptionState()
     state.historyCount = Settings.load(from: defaults).captionHistoryCount
     for i in 0..<8 {
-        state.upsert(id: UUID(), original: "발화 \(i)", isFinal: true, sourceLanguageID: "ko-KR")
+        state.upsert(id: UUID(), original: "발화 \(i)", isFinal: true)
     }
     #expect(state.entries.count == 5)
     #expect(state.entries.first?.original == "발화 3")
@@ -114,9 +114,8 @@ import Foundation
 // 부르도록 되돌아가도 전부 통과한다. 아래 테스트들은 **전사 이벤트**를 먹이는 경로를
 // 통째로 지나므로, 어떤 입력도 목록을 비우지 못한다는 걸 실제로 고정한다.
 
-private func event(_ utteranceID: Int, _ text: String, isFinal: Bool = true,
-                   revision: Int = 0) -> TranscriptEvent {
-    TranscriptEvent(utteranceID: utteranceID, revision: revision, sourceLanguage: .korean,
+private func event(_ utteranceID: Int, _ text: String, isFinal: Bool = true) -> TranscriptEvent {
+    TranscriptEvent(utteranceID: utteranceID, sourceLanguage: .korean,
                     transcript: isFinal ? .final(text) : .partial(text))
 }
 
@@ -136,7 +135,7 @@ private func event(_ utteranceID: Int, _ text: String, isFinal: Bool = true,
     let events = [
         event(0, "첫", isFinal: false), event(0, "첫 문장"),
         event(1, "둘", isFinal: false), event(1, "두 번째 문장"),
-        event(0, "첫 문장입니다", revision: 2),   // 옛 구간의 뒤늦은 final
+        event(0, "첫 문장입니다"),   // 옛 구간의 뒤늦은 final
         event(2, "세 번째", isFinal: false)
     ]
     for e in events {
@@ -150,7 +149,7 @@ private func event(_ utteranceID: Int, _ text: String, isFinal: Bool = true,
 @Test @MainActor func 같은_발화의_갱신은_줄을_늘리지_않는다() {
     let state = CaptionState()
     let first = state.apply(event(7, "안녕", isFinal: false)).first?.id
-    let second = state.apply(event(7, "안녕하세요", revision: 1)).first?.id
+    let second = state.apply(event(7, "안녕하세요")).first?.id
     #expect(first == second) // 같은 발화 = 같은 줄 = 같은 번역 대상
     #expect(state.entries.count == 1)
     #expect(state.entries[0].original == "안녕하세요")
@@ -162,7 +161,7 @@ private func event(_ utteranceID: Int, _ text: String, isFinal: Bool = true,
     state.historyCount = 3
     let old = state.apply(event(0, "첫", isFinal: false)).first?.id
     _ = state.apply(event(1, "둘", isFinal: false))
-    let late = state.apply(event(0, "첫 문장입니다", revision: 1)).first?.id
+    let late = state.apply(event(0, "첫 문장입니다")).first?.id
 
     #expect(late == old)             // 원래 받은 줄로 되돌아간다
     #expect(state.entries.count == 2) // 맨 아래에 중복으로 끼어들지 않는다
@@ -176,7 +175,7 @@ private func event(_ utteranceID: Int, _ text: String, isFinal: Bool = true,
     _ = state.apply(event(0, "밀려날 발화"))
     _ = state.apply(event(1, "최신 발화"))
 
-    #expect(state.apply(event(0, "밀려난 발화의 확정본", revision: 1)).isEmpty)
+    #expect(state.apply(event(0, "밀려난 발화의 확정본")).isEmpty)
     #expect(state.entries.map(\.original) == ["최신 발화"])
 }
 
@@ -203,7 +202,7 @@ private func event(_ utteranceID: Int, _ text: String, isFinal: Bool = true,
     for i in 0..<200 { _ = state.apply(event(i, "발화 \(i)")) }
     #expect(state.entries.count == 2)
     // 아주 오래된 발화는 장부에서도 사라졌으므로 조용히 무시된다.
-    #expect(state.apply(event(0, "태초의 발화", revision: 1)).isEmpty)
+    #expect(state.apply(event(0, "태초의 발화")).isEmpty)
     #expect(state.entries.map(\.original) == ["발화 198", "발화 199"])
 }
 
@@ -232,7 +231,7 @@ private func event(_ utteranceID: Int, _ text: String, isFinal: Bool = true,
 @Test @MainActor func 같은_Run_안에서는_같은_발화_ID가_한_줄을_갱신한다() {
     let state = CaptionState()
     let first = state.apply(event(1, "안녕", isFinal: false), runID: 5).first?.id
-    let second = state.apply(event(1, "안녕하세요", revision: 1), runID: 5).first?.id
+    let second = state.apply(event(1, "안녕하세요"), runID: 5).first?.id
     #expect(first == second) // 같은 Run + 같은 발화 = 같은 줄 = 같은 번역 대상
     #expect(state.entries.count == 1)
     #expect(state.entries[0].original == "안녕하세요")
@@ -288,7 +287,7 @@ private func event(_ utteranceID: Int, _ text: String, isFinal: Bool = true,
     // 문장은 같은 줄·같은 id를 그대로 유지하고(재조합해도 문장 경계가 흔들리면 안
     // 된다), 뒤 조각만 계속 같은 줄에서 자란다.
     let more = growing + " 그리고 계속됩니다"
-    let secondCall = state.apply(event(0, more, isFinal: false, revision: 1))
+    let secondCall = state.apply(event(0, more, isFinal: false))
     #expect(secondCall.count == 2)
     #expect(secondCall[0].id == firstRowID)   // 이미 확정된 줄은 같은 id
     #expect(secondCall[1].id == secondRowID)  // 자라던 뒷줄도 같은 id
