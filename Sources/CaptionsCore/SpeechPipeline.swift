@@ -384,7 +384,12 @@ extension AudioInputQueue: AsyncSequence {
 /// `AudioSinkGate`가 밀어 넣는 대상의 최소 계약. 고정 언어 모드는 `AudioInputQueue`
 /// 하나가 직접 이 역할을 하고(변환도 자신이 한다), 자동 모드는 `DualAudioSink`가 대신
 /// 받아 변환을 한 번만 하고 언어별 두 큐로 나눠 넣는다.
-public protocol AudioIngestSink: Sendable {
+///
+/// `Sendable`을 요구하지 않는다 — 구현체는 실시간 오디오 스레드에서 호출되는
+/// `AudioSinkGate.ingest`를 통해서만 불리고(그 자신이 캡처 스레드 하나로 직렬화를
+/// 이미 보장한다), 그 경계를 넘어 스레드 사이로 값 자체가 오가지 않는다. 여기서
+/// `Sendable`을 강제하면 구현체가 저마다 불필요한 `@unchecked Sendable`을 달아야 한다.
+public protocol AudioIngestSink {
     func ingest(_ buffer: AVAudioPCMBuffer)
 }
 
@@ -392,10 +397,22 @@ extension AudioInputQueue: AudioIngestSink {}
 
 /// 자동 모드 전용 팬아웃. 변환기 하나를 재사용해 원본 버퍼를 **한 번만** 변환하고,
 /// 그 결과를 언어별 두 큐에 나눠 넣는다(각 큐는 다시 변환하지 않는다) — 캡처 스레드
-/// 위에서, 이 객체의 락 아래 직렬화된다는 계약은 `AudioInputQueue.ingest`와 같다.
-/// 변환된 버퍼는 새로 할당된 것이라 두 큐가 같은 인스턴스를 나눠 가져도(읽기만
-/// 하므로) 안전하다 — 복사하지 않는다.
-public final class DualAudioSink: AudioIngestSink, @unchecked Sendable {
+/// 위에서 호출된다는 계약은 `AudioInputQueue.ingest`와 같다.
+///
+/// 두 큐는 **같은 버퍼 인스턴스를 나눠 갖지 않는다**(코드 리뷰 F2) — `primary`는 방금
+/// 변환된 버퍼를 그대로 받고, `secondary`는 채널 데이터를 그대로 복사한 새 버퍼를
+/// 받는다. 두 `SpeechAnalyzer.analyzeSequence`가 동시에 같은 가변 `AVAudioPCMBuffer`를
+/// 읽는 경합을 이 타입이 직접 보장하지 않으므로(문서화된 계약이 아니다), 값을 복사해
+/// 아예 경합의 여지를 없앤다 — 변환은 다시 하지 않으니 비용은 memcpy 한 번뿐이다.
+///
+/// `converter`는 이 타입이 유일하게 들고 있는 가변 상태다. 이 타입은 `Sendable`이
+/// 아니다(코드 리뷰 F3) — `AudioIngestSink`가 `Sendable`을 요구하지 않으므로 그럴
+/// 필요가 없다. `ingest`는 오직 `AudioSinkGate.ingest`를 통해서만, 실시간 캡처
+/// 스레드 하나로 이미 직렬화된 채로 불린다(`AudioInputQueue.ingest`와 같은 호출
+/// 계약). 그래도 락을 두는 건 그 직렬화를 이 타입 혼자 재확인하지 않고 그냥
+/// 믿어야 하는 상태로 남기지 않기 위해서다 — `AudioInputQueue`가 자신의 가변
+/// 상태를 잠그는 것과 같은 이유.
+public final class DualAudioSink: AudioIngestSink {
     private let lock = NSLock()
     private let analysisFormat: AVAudioFormat
     private let primary: AudioInputQueue
@@ -410,23 +427,38 @@ public final class DualAudioSink: AudioIngestSink, @unchecked Sendable {
 
     public func ingest(_ raw: AVAudioPCMBuffer) {
         lock.lock()
-        let converted: [AVAudioPCMBuffer]
+        defer { lock.unlock() }
         do {
             if converter?.inputFormat != raw.format {
                 converter = try AudioBufferConverter(from: raw.format, to: analysisFormat)
             }
-            converted = try converter!.convert(raw)
+            for buffer in try converter!.convert(raw) {
+                primary.ingestConverted(buffer)
+                if let copy = Self.copy(buffer) {
+                    secondary.ingestConverted(copy)
+                } else {
+                    secondary.fail(AudioBufferConverterError.allocationFailed)
+                }
+            }
         } catch {
-            lock.unlock()
             primary.fail(error)
             secondary.fail(error)
-            return
         }
-        lock.unlock()
-        for buffer in converted {
-            primary.ingestConverted(buffer)
-            secondary.ingestConverted(buffer)
+    }
+
+    /// `buffer`와 같은 포맷·길이의 새 버퍼에 오디오 데이터를 그대로 복사한다.
+    /// 인터리브 여부와 무관하게 동작한다 — `AudioBufferList`의 각 버퍼를 그대로
+    /// memcpy한다(채널별 accessor로 나누지 않는다).
+    private static func copy(_ buffer: AVAudioPCMBuffer) -> AVAudioPCMBuffer? {
+        guard let copy = AVAudioPCMBuffer(pcmFormat: buffer.format, frameCapacity: buffer.frameCapacity) else { return nil }
+        copy.frameLength = buffer.frameLength
+        let source = UnsafeMutableAudioBufferListPointer(buffer.mutableAudioBufferList)
+        let destination = UnsafeMutableAudioBufferListPointer(copy.mutableAudioBufferList)
+        for (src, dst) in zip(source, destination) {
+            guard let srcData = src.mData, let dstData = dst.mData else { continue }
+            dstData.copyMemory(from: srcData, byteCount: Int(src.mDataByteSize))
         }
+        return copy
     }
 }
 
@@ -536,18 +568,42 @@ public protocol SpeechEngine: Sendable {
 
 // MARK: - 자동 모드: 신뢰도 기반 언어 중재
 
+/// 두 세션의 final이 서로 짝을 못 찾을 때 얼마나 기다릴지를 결정한다(코드 리뷰 F1).
+/// 실전 구현(`RealTimeGraceClock`)은 실제 시간을 재고, 테스트는 `Signal`과 같은 패턴의
+/// 가짜를 주입해 시간 대신 신호로 결정적으로 통제한다.
+public protocol DualArbitratorClock: Sendable {
+    /// 여유 시간이 지날 때까지 매달린다.
+    func waitGrace() async
+}
+
+/// 실제 벽시계 여유, 기본 0.4초.
+///
+/// 근거: 두 세션은 같은 변환된 오디오를 같은 페이싱으로 받으므로, 같은 발화의 final은
+/// 보통 수십~100ms 안쪽 간격으로 도착한다(실측 프로브 로그 기준). 0.4초는 그 정상
+/// 지터를 넉넉히 덮으면서도, 상대가 진짜로 멎었을 때 화면이 비어 보이는 시간을
+/// 사람이 "끊겼다"고 느끼기 전 수준(수백 ms)으로 제한한다 — 너무 짧으면(예: 100ms)
+/// 정상적인 두 세션 사이의 지터만으로도 성급하게 확정해버려 신뢰도 비교 자체가
+/// 무의미해진다.
+public struct RealTimeGraceClock: DualArbitratorClock {
+    public let seconds: Double
+    public init(seconds: Double = 0.4) { self.seconds = seconds }
+    public func waitGrace() async { try? await Task.sleep(for: .seconds(seconds)) }
+}
+
 /// 언어별로 완전히 따로 도는 두 세션의 결과를 하나의 결과 스트림으로 합친다(스펙 §2).
 ///
 /// 규칙: 발화 단위로 양쪽 final의 confidence(`TranscriptionChunk.confidence`, 이미 조각에
-/// 찍혀 있는 평균값)를 비교해 높은 쪽을 채택한다. partial 단계에서는 직전 발화의 승자
-/// 언어만 그대로 흘려보내고(진 쪽 partial은 버린다), final은 짝이 맞을 때(구간 시작 시각
-/// 차이가 `tolerance` 안쪽) 비교해 확정한다. 동점이거나 둘 다 confidence가 없으면 직전
-/// 승자를 유지한다.
+/// 찍혀 있는 평균값)를 비교해 높은 쪽을 채택한다. **아직 확정된 승자가 없으면**(첫 발화가
+/// 아직 안 끝났으면) 화면이 비지 않도록 양쪽 partial을 다 흘려보낸다 — 한쪽이 첫 인식부터
+/// 느리거나(콜드 스타트) 조용하면 나머지 쪽이라도 보여야 한다(코드 리뷰 F1). 승자가 한 번
+/// 정해진 뒤에는 그 언어의 partial만 보인다. final은 짝이 맞을 때(구간 시작 시각 차이가
+/// `tolerance` 안쪽) 비교해 확정한다. 동점이거나 둘 다 confidence가 없으면 직전 승자를
+/// 유지한다.
 ///
 /// 짝을 기다리는 final은 최대 하나(`awaiting`)만 들고 있는다. 그 짝이 영영 오지 않을 수
-/// 있는 두 경우 — 상대 쪽 스트림이 이미 끝났거나(`sideEnded`), 다음 final이 짝이 아닌 채로
-/// 도착하거나 — 에는 기다리던 쪽을 그대로 채택해 흘려보낸다. 그래서 한쪽이 멎어도(스펙 §2
-/// "한쪽 실패") 다른 쪽이 무한정 막히지 않는다.
+/// 있는 세 경우 — 상대 쪽 스트림이 이미 끝났거나(`sideEnded`), 다음 final이 짝이 아닌 채로
+/// 도착하거나, `clock`의 여유 시간이 먼저 지나거나 — 에는 기다리던 쪽을 그대로 채택해
+/// 흘려보낸다. 그래서 한쪽이 멎어도(스펙 §2 "한쪽 실패") 다른 쪽이 무한정 막히지 않는다.
 actor DualArbitrator {
     enum Side: Sendable { case a, b }
 
@@ -557,16 +613,28 @@ actor DualArbitrator {
     }
 
     private let tolerance: Double
+    private let clock: any DualArbitratorClock
     private let continuation: AsyncThrowingStream<TranscriptionChunk, any Error>.Continuation
     private var winner: CaptionLanguage
+    /// 승자를 한 번이라도 확정했는지. false인 동안은 partial을 언어로 거르지 않는다.
+    private var hasWinner = false
     private var awaiting: Pending?
+    /// `awaiting`을 새로 세울 때마다 올린다. grace 타이머가 뒤늦게 울렸을 때 그사이
+    /// 다른 경로(정상 짝맺기·다음 final·sideEnded)로 이미 처리됐는지 이 값으로 가른다.
+    private var awaitingToken = 0
+    /// 지금 `awaiting`을 지키는 grace 타이머. 다른 경로로 먼저 해소되면 곧바로
+    /// 취소한다 — 안 그러면 실행 내내(테스트라면 가짜 시계가 절대 안 울릴 때까지)
+    /// 매달린 채로 남는다.
+    private var graceTask: Task<Void, Never>?
     private var ended: Set<Side> = []
     private var lastError: (any Error)?
 
     init(initialWinner: CaptionLanguage, tolerance: Double = 0.2,
+         clock: any DualArbitratorClock = RealTimeGraceClock(),
          continuation: AsyncThrowingStream<TranscriptionChunk, any Error>.Continuation) {
         self.winner = initialWinner
         self.tolerance = tolerance
+        self.clock = clock
         self.continuation = continuation
     }
 
@@ -575,25 +643,28 @@ actor DualArbitrator {
             + "신뢰도=\(chunk.confidence.map { String(format: "%.3f", $0) } ?? "-") 구간=\(chunk.start)~\(chunk.end)")
 
         guard chunk.isFinal else {
-            if chunk.language == winner { continuation.yield(chunk) }
+            if !hasWinner || chunk.language == winner { continuation.yield(chunk) }
             return
         }
 
         if let pending = awaiting {
+            // 이 pending은 여기서 어떻게든 끝난다 — grace 타이머를 취소해 정리한다.
+            clearAwaiting()
             if pending.side != side, abs(pending.chunk.start - chunk.start) <= tolerance {
                 adopt(decide(pending.chunk, chunk))
-                awaiting = nil
                 return
             }
-            // 짝이 아니다 — 같은 쪽이 또 냈거나 시간이 안 맞는다. 기다리던 것부터 흘려보낸다.
+            // 짝이 아니다 — 같은 쪽이 또 냈거나 시간이 안 맞는다. 기다리던 것부터 흘려보내고
+            // 이번 것을 새로 기다린다.
             adopt(pending.chunk)
-            awaiting = nil
+            beginWaiting(side: side, chunk: chunk)
+            return
         }
 
         if ended.contains(opposite(of: side)) {
             adopt(chunk) // 상대는 이미 끝났다 — 짝이 다시는 안 온다. 곧바로 채택한다.
         } else {
-            awaiting = Pending(side: side, chunk: chunk)
+            beginWaiting(side: side, chunk: chunk)
         }
     }
 
@@ -603,16 +674,50 @@ actor DualArbitrator {
         ended.insert(side)
         if let error { lastError = error }
         if let pending = awaiting {
+            clearAwaiting()
             adopt(pending.chunk)
-            awaiting = nil
         }
         if ended.count >= 2 {
             if let lastError { continuation.finish(throwing: lastError) } else { continuation.finish() }
         }
     }
 
+    /// 새 final을 기다림 상태로 걸고, `clock`이 여유 시간을 다 쓰면(상대가 안 오면)
+    /// 곧바로 채택하는 백그라운드 타이머를 하나 띄운다. `ingest` 자신은 여기서 멈추지
+    /// 않는다 — 타이머를 기다리느라 같은 쪽의 다음 조각 처리를 막지 않는다.
+    private func beginWaiting(side: Side, chunk: TranscriptionChunk) {
+        awaitingToken += 1
+        let token = awaitingToken
+        awaiting = Pending(side: side, chunk: chunk)
+        let clock = clock
+        graceTask = Task { [weak self] in
+            await clock.waitGrace()
+            await self?.graceExpired(token: token)
+        }
+    }
+
+    private func graceExpired(token: Int) {
+        // 토큰이 안 맞으면 이미 다른 경로로 처리된 뒤다 — 아무 일도 하지 않는다.
+        guard token == awaitingToken, let pending = awaiting else { return }
+        awaiting = nil
+        graceTask = nil
+        adopt(pending.chunk)
+    }
+
+    /// `awaiting`을 다른 경로(정상 짝맺기·다음 final·sideEnded)로 이미 처리할 때 부른다.
+    /// 지키고 있던 grace 타이머를 취소해서 실행 내내(테스트라면 가짜 시계가 절대 안
+    /// 울릴 때까지) 매달린 태스크로 남지 않게 한다. 토큰도 같이 올려 만에 하나 취소가
+    /// 늦게 반영돼도 `graceExpired`가 스스로 무효화한다.
+    private func clearAwaiting() {
+        awaitingToken += 1
+        awaiting = nil
+        graceTask?.cancel()
+        graceTask = nil
+    }
+
     private func adopt(_ chunk: TranscriptionChunk) {
         winner = chunk.language
+        hasWinner = true
         continuation.yield(chunk)
     }
 
@@ -672,14 +777,18 @@ public final class SpeechPipeline {
 
     private let engine: any SpeechEngine
     private let makeSource: SourceFactory
+    /// 자동 모드에서 `DualArbitrator`가 쓰는 시계. 테스트는 결정적인 가짜를 주입한다.
+    private let autoModeGrace: any DualArbitratorClock
     private var current: Run?
 
     public var onEvent: (@MainActor (PipelineEvent) -> Void)?
 
     public init(engine: any SpeechEngine = SystemSpeechEngine(),
-                makeSource: @escaping SourceFactory = { _ in MicSource() }) {
+                makeSource: @escaping SourceFactory = { _ in MicSource() },
+                autoModeGrace: any DualArbitratorClock = RealTimeGraceClock()) {
         self.engine = engine
         self.makeSource = makeSource
+        self.autoModeGrace = autoModeGrace
     }
 
     public var isListening: Bool { current?.listening ?? false }
@@ -862,7 +971,7 @@ public final class SpeechPipeline {
         try checkAlive(run)
 
         let (merged, continuation) = AsyncThrowingStream<TranscriptionChunk, any Error>.makeStream()
-        let arbitrator = DualArbitrator(initialWinner: run.language, continuation: continuation)
+        let arbitrator = DualArbitrator(initialWinner: run.language, clock: autoModeGrace, continuation: continuation)
         let taskA = Task {
             do {
                 for try await chunk in streamA { await arbitrator.ingest(chunk, side: .a) }

@@ -57,7 +57,7 @@ public final class CaptionState {
     /// 시작/정지 버튼 제목. "정지 중…", "다시 시작" 같은 중간 상태까지 그대로 보여준다.
     public var toggleTitle = "시작"
     public var canToggle = true
-    /// 언어 버튼 제목. 자동 모드에서는 언어 이름이 아니라 "자동 (실험)"이 붙는다.
+    /// 언어 버튼 제목. 자동 모드에서는 언어 이름이 아니라 "자동"이 붙는다.
     public var languageTitle = CaptionLanguage.korean.displayName
     public var sourceLanguage: CaptionLanguage = .korean
     public var targetLanguage: CaptionLanguage = .english

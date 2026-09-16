@@ -49,6 +49,37 @@ final class Signal {
     }
 }
 
+/// 절대 안 울리는 grace 시계. `DualArbitrator`의 grace 폴백을 쓰지 않는 대부분의
+/// 자동 모드 테스트는 이걸 기본으로 써서, 정상 짝맺기 경로만으로 판정이 끝나게 한다.
+/// 진짜 못 끝나는 continuation을 만드는 대신 아주 긴 sleep을 쓴다 — `Task.sleep`은
+/// 취소에 정상적으로 반응해서 던지므로(`DualArbitrator`가 짝을 다른 경로로 이미
+/// 맺으면 grace 태스크를 취소한다), 실행 중 끝나지 않는 continuation이 안 남는다.
+struct NeverGraceClock: DualArbitratorClock {
+    func waitGrace() async { try? await Task.sleep(for: .seconds(86_400)) }
+}
+
+/// grace 폴백 자체를 테스트할 때 쓰는 가짜 시계 — `Signal`과 같은 fire-then-wait /
+/// wait-then-fire 패턴이라 실시간 sleep 없이 결정적으로 "여유가 다 됐다"를 알린다.
+/// actor라서 `DualArbitrator`(actor) 안에서도 안전하게 캡처된다.
+actor ManualGraceClock: DualArbitratorClock {
+    private var continuation: CheckedContinuation<Void, Never>?
+    private var firedEarly = false
+
+    func waitGrace() async {
+        if firedEarly { firedEarly = false; return }
+        await withCheckedContinuation { continuation = $0 }
+    }
+
+    func fire() {
+        if let continuation {
+            self.continuation = nil
+            continuation.resume()
+        } else {
+            firedEarly = true
+        }
+    }
+}
+
 enum TestError: LocalizedError {
     case installFailed
     case startFailed
@@ -370,7 +401,12 @@ struct Harness {
 
     init(engine: FakeSpeechEngine = FakeSpeechEngine(),
          sourceFormat: AVAudioFormat = micFormat48kStereo,
-         blockSourceStarts: Int = 0) {
+         blockSourceStarts: Int = 0,
+         // 기본값은 "절대 안 울리는" 시계다 — grace 폴백을 안 쓰는 테스트가 실제 시간
+         // 경합으로 우연히 흔들리지 않게 한다. grace 자체를 테스트할 때만
+         // `ManualGraceClock`을 넘긴다(신호로 결정적으로 통제, PipelineControllerTests
+         // 안에서는 실시간 sleep을 쓰지 않는다).
+         graceClock: any DualArbitratorClock = NeverGraceClock()) {
         self.engine = engine
         let box = sourceBox
         let created = sourceCreated
@@ -386,7 +422,7 @@ struct Harness {
             box.mutate { $0 = source }
             created.fire()
             return source
-        })
+        }, autoModeGrace: graceClock)
         controller = PipelineController(pipeline: pipeline)
         let events = self.events
         let states = self.states
@@ -1243,22 +1279,76 @@ let autoConfig = PipelineConfiguration(source: .microphone, language: .korean, s
     }
 }
 
-@Test @MainActor func 자동_모드에서_진_쪽의_partial은_화면에_나타나지_않는다() async {
+// 코드 리뷰 F1: 승자가 아직 없을 때(첫 발화가 아직 안 끝났을 때) partial을 한쪽만
+// 보여주면, 그 한쪽이 콜드 스타트로 느리거나 조용한 경우 화면이 통째로 비어 보일 수
+// 있다. 승자가 없는 동안은 양쪽 partial을 다 흘려보내고, 승자가 한 번 정해진 뒤에야
+// 그 언어만 보여준다.
+@Test @MainActor func 승자가_아직_없으면_양쪽_partial이_다_화면에_뜬다() async {
     let harness = Harness()
     harness.controller.requestStart(configuration: autoConfig)
     await harness.waitUntilListening()
     let ko = harness.engine.sessions.wrapped[0]
     let en = harness.engine.sessions.wrapped[1]
 
-    // 아직 아무 발화도 확정되지 않았다 — "직전 승자"는 설정된 주 언어(한국어)다.
+    // 아직 아무 발화도 확정되지 않았다 — 화면이 비지 않도록 둘 다 보여야 한다.
     ko.emit("듣는 중", isFinal: false, start: 0, end: 0.5)
     en.emit("listening", isFinal: false, start: 0, end: 0.5)
     await harness.waitForEvent {
-        if case .transcript(let e) = $0.kind { return e.text == "듣는 중" }
+        if case .transcript(let e) = $0.kind { return e.text == "listening" }
         return false
     }
 
-    #expect(harness.transcripts.map(\.text) == ["듣는 중"]) // 영어 partial은 버려졌다
+    #expect(harness.transcripts.map(\.text) == ["듣는 중", "listening"])
+}
+
+@Test @MainActor func 승자가_정해진_뒤에는_진_쪽의_다음_partial이_버려진다() async {
+    let harness = Harness()
+    harness.controller.requestStart(configuration: autoConfig)
+    await harness.waitUntilListening()
+    let ko = harness.engine.sessions.wrapped[0]
+    let en = harness.engine.sessions.wrapped[1]
+
+    // 첫 발화를 확정해 승자(한국어)를 정한다.
+    ko.emit("첫 문장", isFinal: true, start: 0, end: 1, confidence: 0.9)
+    en.emit("first", isFinal: true, start: 0, end: 1, confidence: 0.2)
+    await harness.waitForEvent {
+        if case .transcript(let e) = $0.kind { return e.text == "첫 문장" }
+        return false
+    }
+
+    // 다음 발화의 partial — 영어(진 쪽) partial은 이제 버려진다.
+    ko.emit("두 번째 듣는 중", isFinal: false, start: 3, end: 3.5)
+    en.emit("second listening", isFinal: false, start: 3, end: 3.5)
+    await harness.waitForEvent {
+        if case .transcript(let e) = $0.kind { return e.text == "두 번째 듣는 중" }
+        return false
+    }
+
+    #expect(harness.transcripts.map(\.text) == ["첫 문장", "두 번째 듣는 중"])
+}
+
+// 코드 리뷰 F1: `awaiting`은 짝이 영영 안 올 수 있다(상대가 멎었을 때) — grace 시계가
+// 다 되면 무한정 기다리지 않고 기다리던 쪽을 그대로 채택한다. 실시간 sleep 대신
+// `ManualGraceClock`을 주입해 "여유가 다 됐다"를 신호로 결정적으로 알린다.
+@Test @MainActor func 상대가_영원히_조용해도_grace가_지나면_먼저_온_final을_채택한다() async {
+    let clock = ManualGraceClock()
+    let harness = Harness(graceClock: clock)
+    harness.controller.requestStart(configuration: autoConfig)
+    await harness.waitUntilListening()
+    let ko = harness.engine.sessions.wrapped[0]
+    // en은 끝까지 아무것도 내지 않는다(콜드 스타트로 죽은 것처럼) — sideEnded도 안 부른다.
+
+    ko.emit("한국어만 말했다", isFinal: true, start: 0, end: 1, confidence: 0.8)
+    // en은 끝까지 짝을 주지 않는다 — grace가 없다면 이 final은 영원히 `awaiting`에
+    // 머문다. 시계를 울려 "여유가 다 됐다"를 알리면 그제서야 채택돼 나온다.
+    await clock.fire()
+    await harness.waitForEvent {
+        if case .transcript(let e) = $0.kind { return e.text == "한국어만 말했다" }
+        return false
+    }
+
+    #expect(harness.transcripts.map(\.text) == ["한국어만 말했다"])
+    #expect(harness.transcripts[0].sourceLanguage == .korean)
 }
 
 @Test @MainActor func 고정_모드는_자동_모드_도입_뒤에도_그대로다() async {
