@@ -1006,7 +1006,13 @@ private func stopListening() {
 clear 타이머를 취소하고 이후 Task 6에서 번역 세대도 무효화한다.
 `running`과 버튼 상태는 controller의 starting/listening/stopping/stopped/failed 상태에서
 한 번에 갱신한다. 시작 요청만 보냈다고 listening 상태로 바꾸지 않는다.
-전사 수신 시 원문 갱신, 이전 번역 무효화, 번역 요청, 유지 타이머 재예약을 함께 처리한다.
+전사 수신 시 원문 갱신, 번역 요청, 유지 타이머 재예약을 함께 처리한다.
+
+**발화마다 자막을 지우지 않는다**(스펙 §6.6). 기준 커밋의 `voiceDetected()` 는 새 발화가
+감지되면 라벨을 즉시 비웠고, 그래서 읽을 시간이 없었다. 그 동작을 되살리지 않는다.
+같은 발화 ID 의 부분 결과는 기존 줄을 갱신하고, 새 ID 는 새 줄이 된다.
+전체 비우기는 **`captionHoldSeconds` 만큼 침묵이 이어진 뒤에만** 한다 —
+말이 이어지는 동안에는 타이머를 계속 뒤로 미룬다.
 
 자동 모드는 UI에 `자동 (실험)`으로 표시하고 기본값은 고정 한국어로 둔다. 문자열 분류는
 현재 locale의 오인식에 종속되므로 자동 전환 성공을 보장하지 않는다. 실험 모드에서만
@@ -1056,7 +1062,8 @@ Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>"
 
 **Files:**
 - Create: `Sources/CaptionsCore/Translator.swift`, `Tests/CaptionsCoreTests/TranslatorTests.swift`
-- Modify: `Sources/LiveBilingualCaptions/main.swift` — `translate(_:)` 463–489줄 제거, `Translator` 배선
+- Modify: `Sources/LiveBilingualCaptions/main.swift` — Google 번역 경로 제거, `Translator` 배선
+  (Task 5가 이 파일을 이미 재작성했으므로 기준 커밋 줄번호로 찾지 말고 심볼명으로 찾는다)
 
 **Interfaces:**
 - Consumes: `CaptionLanguage`, `LanguageTable` (Task 2), `Transcript`와 발화 ID (Task 5)
@@ -1064,7 +1071,7 @@ Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>"
   - `public protocol TranslationRefiner: Sendable { func refine(_ draft: String, source: String, context: [String]) async throws -> String }`
   - `public enum PackStatus: Sendable, Equatable { case installed, needsDownload, unsupported }`
   - `public typealias TranslateFunction = @Sendable (String, CaptionLanguage, CaptionLanguage) async -> String?`
-  - `@MainActor public final class Translator` — `init(table:translate:)`, `onDevice`, `refiner`, `preferredTargetID`, `onTranslation`, `packStatus(from:to:)`, `submit(_:from:captionID:) -> Task<Void, Never>?`, `handle(_:from:captionID:) async` (테스트 편의), `reset()`
+  - `@MainActor public final class Translator` — `init(table:translate:)`, `onDevice`, `refiner`, `preferredTargetID`, `onTranslation` (번역문·보정여부·**발화 ID**), `packStatus(from:to:)`, `submit(_:from:captionID:) -> Task<Void, Never>?`, `handle(_:from:captionID:) async` (테스트 편의), `reset()`
 
 번역 디바운스는 submit이 소유한 Task에서 처리한다. 별도 Debouncer actor에 비동기로 취소를
 보내면 reset 직후 새 작업까지 취소하는 경합이 생길 수 있다. 그래서 Task 3에서 Debouncer를
@@ -1211,8 +1218,9 @@ public final class Translator {
     public var refiner: TranslationRefiner? {
         didSet { reset() } // 끄기·키 교체 시 이미 진행 중인 보정 응답도 무효화
     }
-    /// (번역문, 보정됨) — 보정됨이 true 면 크로스페이드로 교체하라는 뜻.
-    public var onTranslation: (@MainActor (String, Bool) -> Void)?
+    /// (번역문, 보정됨, 발화 ID) — 보정됨이 true 면 크로스페이드로 교체하라는 뜻.
+    /// 발화 ID 가 있어야 늦게 도착한 번역을 자막 목록의 **해당 줄에만** 반영할 수 있다.
+    public var onTranslation: (@MainActor (String, Bool, UUID) -> Void)?
 
     public init(table: LanguageTable, translate: @escaping TranslateFunction = Translator.onDevice) {
         self.table = table
@@ -1298,7 +1306,7 @@ public final class Translator {
                       captionID: UUID, ticket: UInt64) async {
         guard let draft = await translate(text, source, target),
               isCurrent(ticket) else { return }
-        onTranslation?(draft, false)
+        onTranslation?(draft, false, captionID)
         guard isCurrent(ticket), isFinal, !refinedIDs.contains(captionID) else { return }
         let context = recentFinals // 현재 문장을 '직전 문장들'에 중복해서 넣지 않는다
         recentFinals.append(text)
@@ -1323,21 +1331,28 @@ Expected: 기존 테스트와 Step 5a의 응답 순서 회귀 테스트 전부 P
 
 - [ ] **Step 5: `main.swift` 에서 Google 번역 제거**
 
-기준 커밋 463–489줄 `translate(_:)` 전체와 `scheduleTranslation`, `translateWork`,
-`pendingTranslationText`, `lastTranslationStartedAt`, `lastTranslatedSource` 를 삭제하고
-`Translator` 로 대체한다.
+다음 심볼을 전부 삭제하고 `Translator` 로 대체한다: `translate(_:)`, `scheduleTranslation`,
+`translateWork`, `pendingTranslationText`, `lastTranslationStartedAt`, `lastTranslatedSource`.
+Task 5가 이 파일을 이미 재작성했으므로 **기준 커밋의 줄번호로 찾지 않는다.** 심볼명으로 찾는다.
+삭제 후 `grep -n 'translateWork\|pendingTranslationText\|lastTranslationStartedAt' Sources/` 가
+비어 있어야 한다.
+
+Task 7 이전이라 아직 AppKit 라벨을 쓰지만, **번역은 발화 ID 로 라우팅한다.**
+Task 7 이 목록 UI 로 바꿀 때 이 경로가 그대로 `state.setTranslation(_:for:)` 가 된다.
 
 ```swift
 private let translator = Translator(table: .default)
+private var currentCaptionID: UUID?
 
 // buildWindow() 끝에 배선:
-translator.onTranslation = { [weak self] text, refined in
-    guard let self else { return }
+translator.onTranslation = { [weak self] text, refined, captionID in
+    guard let self, captionID == self.currentCaptionID else { return }  // 늦게 온 응답 폐기
     if refined {
         NSAnimationContext.runAnimationGroup { ctx in
             ctx.duration = 0.2
             self.translatedLabel.animator().alphaValue = 0
         } completionHandler: {
+            guard captionID == self.currentCaptionID else { return }
             self.translatedLabel.stringValue = text
             self.translatedLabel.animator().alphaValue = 1
         }
@@ -1416,6 +1431,9 @@ Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>"
 
 - [ ] **Step 1: `CaptionState` 작성**
 
+자막은 **한 줄짜리 현재 상태가 아니라 최근 발화의 목록**이다(스펙 §6.6).
+기준 커밋은 새 발화가 감지되면 이전 자막을 즉시 지워서 읽을 시간이 없었다.
+
 `Sources/LiveBilingualCaptions/CaptionState.swift`:
 ```swift
 import SwiftUI
@@ -1424,22 +1442,71 @@ import CaptionsCore
 @Observable
 @MainActor
 final class CaptionState {
-    var original = "말을 시작하면 원문이 여기에 표시됩니다"
-    var translated = "번역이 여기에 표시됩니다"
+    /// 최근 발화들. 마지막 원소가 가장 최신이며 진행 중일 수 있다.
+    var entries: [CaptionEntry] = []
     var status = "준비 중…"
     var fontSize: Double = 20
+    var historyCount = 3
     var isRunning = false
-    var translatedIsRefined = false
+    var audioSourceName = "마이크"
     var sourceLanguage: CaptionLanguage = .korean
     var targetLanguage: CaptionLanguage = .english
 
-    func clear() {
-        original = ""
-        translated = ""
-        translatedIsRefined = false
+    var isEmpty: Bool { entries.isEmpty }
+
+    /// 같은 발화 ID면 기존 항목을 갱신하고, 새 ID면 항목을 추가한다.
+    /// 발화마다 화면을 비우지 않는다 — 연속 발화 중에는 이전 자막이 남아야 한다.
+    func upsert(id: UUID, original: String, isFinal: Bool, sourceLanguageID: String) {
+        if let i = entries.firstIndex(where: { $0.id == id }) {
+            entries[i].original = original
+            entries[i].isFinal = isFinal
+        } else {
+            entries.append(CaptionEntry(id: id, original: original, translated: "",
+                                        isFinal: isFinal, sourceLanguageID: sourceLanguageID))
+        }
+        trim()
+    }
+
+    /// 늦게 도착한 번역은 해당 발화에만 반영한다. 다른 항목을 건드리지 않는다.
+    func setTranslation(_ text: String, for id: UUID) {
+        guard let i = entries.firstIndex(where: { $0.id == id }) else { return }
+        entries[i].translated = text
+    }
+
+    private func trim() {
+        let limit = max(1, historyCount)
+        if entries.count > limit { entries.removeFirst(entries.count - limit) }
+    }
+
+    func clear() { entries.removeAll() }
+}
+```
+
+`CaptionEntry` 는 `CaptionsCore` 에 둔다 (`Sources/CaptionsCore/CaptionEntry.swift`):
+```swift
+import Foundation
+
+public struct CaptionEntry: Identifiable, Sendable, Equatable {
+    public let id: UUID
+    public var original: String
+    public var translated: String
+    public var isFinal: Bool
+    public var sourceLanguageID: String
+
+    public init(id: UUID, original: String, translated: String,
+                isFinal: Bool, sourceLanguageID: String) {
+        self.id = id
+        self.original = original
+        self.translated = translated
+        self.isFinal = isFinal
+        self.sourceLanguageID = sourceLanguageID
     }
 }
 ```
+
+`Settings` 에 `captionHistoryCount: Int`(기본 3)를 추가한다. Task 3 이 만든
+`Sources/CaptionsCore/Settings.swift` 를 수정하고, **구버전 JSON 호환 테스트를 갱신해
+이 필드가 없는 저장본도 기본값 3으로 읽히는지** 확인한다.
 
 - [ ] **Step 2: `CaptionOverlay` 작성**
 
@@ -1465,20 +1532,31 @@ struct CaptionOverlay: View {
 
     var body: some View {
         VStack(spacing: 7) {
-            Text(state.original)
-                .font(.system(size: state.fontSize, weight: .semibold))
-                .foregroundStyle(.white)
+            // 최근 발화를 쌓아 보여준다. 최신이 아래, 가장 밝게. 위로 갈수록 흐려진다.
+            ForEach(Array(state.entries.enumerated()), id: \.element.id) { index, entry in
+                let age = state.entries.count - 1 - index      // 0 = 최신
+                let dim = max(0.35, 1.0 - Double(age) * 0.28)
+                VStack(spacing: 3) {
+                    Text(entry.original)
+                        .font(.system(size: state.fontSize, weight: .semibold))
+                        .foregroundStyle(.white.opacity(dim))
+                    if !entry.translated.isEmpty {
+                        Text(entry.translated)
+                            .font(.system(size: state.fontSize * 0.8, weight: .medium))
+                            .foregroundStyle(.white.opacity(dim * 0.72))
+                            .animation(.easeInOut(duration: 0.2), value: entry.translated)
+                    }
+                }
                 .lineLimit(2)
                 .multilineTextAlignment(.center)
                 .frame(maxWidth: .infinity)
-
-            Text(state.translated)
-                .font(.system(size: state.fontSize * 0.8, weight: .medium))
-                .foregroundStyle(.white.opacity(0.72))
-                .lineLimit(2)
-                .multilineTextAlignment(.center)
-                .frame(maxWidth: .infinity)
-                .animation(.easeInOut(duration: 0.2), value: state.translated)
+            }
+            if state.isEmpty {
+                Text("말을 시작하면 자막이 여기에 표시됩니다")
+                    .font(.system(size: state.fontSize, weight: .semibold))
+                    .foregroundStyle(.white.opacity(0.45))
+                    .frame(maxWidth: .infinity)
+            }
 
             HStack {
                 Text(state.status)
@@ -1795,12 +1873,8 @@ struct SettingsView: View {
                     Text("유지 시간 \(Int(settings.captionHoldSeconds))초")
                 }
             }
-            Section("번역 보정") {
-                Toggle("Claude 로 확정 문장 다듬기", isOn: $settings.refinementEnabled)
-                Text("켜면 확정된 문장만 인터넷으로 전송됩니다. 끄면 모든 처리가 기기 안에서 끝납니다.")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-            }
+            // "번역 보정" 섹션은 Task 10이 추가한다. updateRefiner()가 아직 없으므로
+            // 여기서 토글을 노출하면 동작하지 않는 스위치가 되고 apply()가 컴파일되지 않는다.
         }
         .formStyle(.grouped)
         .frame(width: 420)
@@ -1895,9 +1969,7 @@ private func apply(_ new: Settings) {
     if old.captionHoldSeconds != new.captionHoldSeconds {
         rescheduleCaptionClear()
     }
-    if old.refinementEnabled != new.refinementEnabled {
-        updateRefiner() // Task 10에서 구현. 그전에는 미연결 토글을 표시하지 않는다.
-    }
+    // refinementEnabled 분기는 Task 10이 updateRefiner()와 함께 추가한다.
 }
 ```
 
@@ -2130,6 +2202,24 @@ public struct ClaudeRefiner: TranslationRefiner {
         return text.trimmingCharacters(in: .whitespacesAndNewlines)
     }
 }
+```
+
+- [ ] **Step 3a: Task 9가 미뤄둔 보정 UI와 분기를 추가**
+
+Task 9는 `updateRefiner()` 가 없어 이 둘을 넣지 않았다. 지금 함께 넣는다.
+
+`SettingsView` 에 섹션을 추가한다:
+```swift
+Section("번역 보정") {
+    Toggle("Claude 로 확정 문장 다듬기", isOn: $settings.refinementEnabled)
+    Text("켜면 확정된 문장만 인터넷으로 전송됩니다. 끄면 모든 처리가 기기 안에서 끝납니다.")
+        .font(.caption).foregroundStyle(.secondary)
+}
+```
+
+`AppDelegate.apply(_:)` 에 분기를 추가한다:
+```swift
+if old.refinementEnabled != new.refinementEnabled { updateRefiner() }
 ```
 
 - [ ] **Step 4: 설정 창에 API 키 입력란 추가**

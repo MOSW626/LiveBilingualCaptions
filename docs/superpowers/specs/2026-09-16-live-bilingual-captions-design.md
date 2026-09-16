@@ -222,7 +222,8 @@ struct CaptionLanguage: Equatable {
 ### 6.5 설정 — `Settings.swift`
 
 `UserDefaults` 영속 항목: 언어 모드, 기본 번역 대상, 오디오 소스, 창 위치·크기, 폰트 크기,
-LLM 보정 on/off, 자막 유지 시간, `SpeechDetector` 민감도.
+LLM 보정 on/off, 자막 유지 시간, **자막 누적 개수(`captionHistoryCount`, 기본 3, 1~10)**,
+`SpeechDetector` 민감도.
 
 설정 변경은 이전 값과 비교한 뒤 저장·UI 갱신·필요한 파이프라인 재구성을 한 경로에서 수행한다.
 소스·고정 언어·민감도 변경은 실행 중 즉시 적용한다. 중지 중에는 다음 시작에 적용한다.
@@ -230,7 +231,32 @@ LLM 보정 on/off, 자막 유지 시간, `SpeechDetector` 민감도.
 
 설정 창은 SwiftUI. `LSUIElement` 앱이므로 메뉴바 상태 아이템에서 연다.
 
-### 6.6 UI — `CaptionOverlay.swift`
+### 6.6 자막 누적 (2026-09-16 추가 요구사항)
+
+**사용자 관찰:** "사람이 말을 보통 바로 이어서 쭈르륵 하니까" — 발화가 연속으로 이어지는데
+기준 커밋은 새 발화가 감지되는 순간 이전 자막을 지운다(`main.swift:273`). 읽을 시간이 없다.
+
+자막은 **한 줄짜리 현재 상태가 아니라 최근 발화의 목록**이다.
+
+```swift
+public struct CaptionEntry: Identifiable, Sendable, Equatable {
+    public let id: UUID              // 파이프라인이 발급한 발화 ID
+    public var original: String
+    public var translated: String
+    public var isFinal: Bool
+    public var sourceLanguageID: String
+}
+```
+
+- 오버레이는 최근 `captionHistoryCount` 개(기본 3)를 쌓아 보여준다. 최신이 아래, 가장 밝게.
+  위로 갈수록 흐려진다. 진행 중인 부분 전사는 맨 아래 항목을 갱신한다.
+- **발화마다 지우지 않는다.** 목록은 `captionHoldSeconds` 만큼 **침묵이 이어진 뒤에만** 비운다.
+  연속해서 말하는 동안에는 이전 발화가 화면에 남는다. 이것이 이 요구사항의 핵심이다.
+- 같은 발화 ID의 부분 결과는 기존 항목을 갱신하고 새 항목을 만들지 않는다.
+- 번역이 늦게 도착하면 해당 ID의 항목에만 반영한다. 다른 항목을 건드리지 않는다.
+- 항목 수가 넘치면 가장 오래된 것부터 버린다.
+
+### 6.7 UI — `CaptionOverlay.swift`
 
 기준 커밋의 시각 디자인(HUD 재질, 20pt 원문 / 16pt 번역, 라운드 20, 화면 하단 중앙)을
 유지한다. 잘 동작하는 디자인이므로 바꿀 이유가 없다. SwiftUI로 옮기면서 얻는 것:
@@ -304,7 +330,7 @@ AudioSource ──AVAudioPCMBuffer──▶ SpeechPipeline
 | 1 | SPM 전환, 타깃 분리, `build.sh` 개편, 자체서명 인증서 | 실행 타깃은 임시 Swift 5 모드로 기존 기능 유지, Core는 Swift 6 |
 | 2 | 인식 엔진 교체 (`SpeechAnalyzer`) | 고정 한국어/영어 및 수동 전환, 입력 포맷 변환, 시작 취소 검증 |
 | 3 | 번역 1단 교체 (Apple Translation), Google 제거 | 네트워크 끄고도 번역 동작 |
-| 4 | SwiftUI 뷰 이주, `.translationTask` 부착, 실행 타깃 Swift 6 전환 | 동시성 빌드 통과, 언어팩 미설치 시 다운로드 시트 표시 |
+| 4 | SwiftUI 뷰 이주, **자막 누적 렌더링**, `.translationTask` 부착, 실행 타깃 Swift 6 전환 | 동시성 빌드 통과, 연속 발화 시 이전 자막 유지, 언어팩 미설치 시 다운로드 시트 표시 |
 | 5 | `SystemAudioSource` + 소스 전환 UI | Zoom/YouTube 소리가 자막으로 출력 |
 | 6 | 설정 영속 + 설정 창 + 언어 테이블 확장 | 설정 즉시 적용·재실행 복원, 추가 언어의 지원 상태 검증 |
 | 7 | LLM 보정 (옵션, Keychain) | 꺼도 앱이 완전히 동작 |
