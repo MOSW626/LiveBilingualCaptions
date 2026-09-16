@@ -9,11 +9,17 @@ public struct PipelineConfiguration: Sendable, Equatable {
     public var source: AudioSourceKind
     public var language: CaptionLanguage
     public var sensitivity: DetectorSensitivity
+    /// nil = 고정 언어 모드(세션 한 벌). 값이 있으면 자동 모드 — `language`(주 언어)와
+    /// 이 언어, 두 벌을 동시에 돌려 발화마다 신뢰도로 고른다(스펙 §2). 하드 제약(실측):
+    /// 분석기 하나에 전사기 둘을 물리면 SIGTRAP이라 언어별로 분석기 자체를 두 벌 쓴다.
+    public var secondaryLanguage: CaptionLanguage?
 
-    public init(source: AudioSourceKind, language: CaptionLanguage, sensitivity: DetectorSensitivity) {
+    public init(source: AudioSourceKind, language: CaptionLanguage, sensitivity: DetectorSensitivity,
+                secondaryLanguage: CaptionLanguage? = nil) {
         self.source = source
         self.language = language
         self.sensitivity = sensitivity
+        self.secondaryLanguage = secondaryLanguage
     }
 }
 
@@ -255,18 +261,55 @@ public final class AudioInputQueue: @unchecked Sendable {
                 converter = try AudioBufferConverter(from: raw.format, to: analysisFormat)
             }
             for buffer in try converter!.convert(raw) {
-                pending.append(buffer)
-                pendingFrames += Int(buffer.frameLength)
+                appendLocked(buffer)
             }
             if pendingFrames > capacityFrames { throw AudioInputQueueError.overflow }
         } catch {
-            failure = error
-            pending.removeAll()
-            pendingFrames = 0
+            failLocked(error)
         }
         let handoff = takeWaiterLocked()
         lock.unlock()
         deliver(handoff)
+    }
+
+    /// 이미 변환된 버퍼를 받는다 — 자동 모드의 팬아웃(`DualAudioSink`)이 변환을 상류에서
+    /// 한 번만 하고, 언어별 큐에는 결과만 나눠 넣을 때 쓴다. 변환기를 갖지 않고 같은
+    /// 백프레셔·상한 규칙만 각자 적용한다.
+    public func ingestConverted(_ buffer: AVAudioPCMBuffer) {
+        lock.lock()
+        if finished || failure != nil {
+            lock.unlock()
+            return
+        }
+        appendLocked(buffer)
+        if pendingFrames > capacityFrames { failLocked(AudioInputQueueError.overflow) }
+        let handoff = takeWaiterLocked()
+        lock.unlock()
+        deliver(handoff)
+    }
+
+    /// 상류(팬아웃의 공유 변환)에서 난 오류를 이 큐의 소비자에게도 흘린다.
+    public func fail(_ error: any Error) {
+        lock.lock()
+        if finished || failure != nil {
+            lock.unlock()
+            return
+        }
+        failLocked(error)
+        let handoff = takeWaiterLocked()
+        lock.unlock()
+        deliver(handoff)
+    }
+
+    private func appendLocked(_ buffer: AVAudioPCMBuffer) {
+        pending.append(buffer)
+        pendingFrames += Int(buffer.frameLength)
+    }
+
+    private func failLocked(_ error: any Error) {
+        failure = error
+        pending.removeAll()
+        pendingFrames = 0
     }
 
     /// 더 이상 입력이 없다. 기다리던 소비자는 nil을 받고 시퀀스를 끝낸다.
@@ -338,11 +381,60 @@ extension AudioInputQueue: AsyncSequence {
     public func makeAsyncIterator() -> AsyncIterator { AsyncIterator(queue: self) }
 }
 
+/// `AudioSinkGate`가 밀어 넣는 대상의 최소 계약. 고정 언어 모드는 `AudioInputQueue`
+/// 하나가 직접 이 역할을 하고(변환도 자신이 한다), 자동 모드는 `DualAudioSink`가 대신
+/// 받아 변환을 한 번만 하고 언어별 두 큐로 나눠 넣는다.
+public protocol AudioIngestSink: Sendable {
+    func ingest(_ buffer: AVAudioPCMBuffer)
+}
+
+extension AudioInputQueue: AudioIngestSink {}
+
+/// 자동 모드 전용 팬아웃. 변환기 하나를 재사용해 원본 버퍼를 **한 번만** 변환하고,
+/// 그 결과를 언어별 두 큐에 나눠 넣는다(각 큐는 다시 변환하지 않는다) — 캡처 스레드
+/// 위에서, 이 객체의 락 아래 직렬화된다는 계약은 `AudioInputQueue.ingest`와 같다.
+/// 변환된 버퍼는 새로 할당된 것이라 두 큐가 같은 인스턴스를 나눠 가져도(읽기만
+/// 하므로) 안전하다 — 복사하지 않는다.
+public final class DualAudioSink: AudioIngestSink, @unchecked Sendable {
+    private let lock = NSLock()
+    private let analysisFormat: AVAudioFormat
+    private let primary: AudioInputQueue
+    private let secondary: AudioInputQueue
+    private var converter: AudioBufferConverter?
+
+    public init(analysisFormat: AVAudioFormat, primary: AudioInputQueue, secondary: AudioInputQueue) {
+        self.analysisFormat = analysisFormat
+        self.primary = primary
+        self.secondary = secondary
+    }
+
+    public func ingest(_ raw: AVAudioPCMBuffer) {
+        lock.lock()
+        let converted: [AVAudioPCMBuffer]
+        do {
+            if converter?.inputFormat != raw.format {
+                converter = try AudioBufferConverter(from: raw.format, to: analysisFormat)
+            }
+            converted = try converter!.convert(raw)
+        } catch {
+            lock.unlock()
+            primary.fail(error)
+            secondary.fail(error)
+            return
+        }
+        lock.unlock()
+        for buffer in converted {
+            primary.ingestConverted(buffer)
+            secondary.ingestConverted(buffer)
+        }
+    }
+}
+
 /// 캡처 콜백과 큐 사이의 스위치. 정리의 첫 단계는 "sink 수신 차단"이고, 큐가 아직
 /// 없는 시점(포맷 협상 전)에 도착한 버퍼도 여기서 흘려보낸다.
 public final class AudioSinkGate: @unchecked Sendable {
     private let lock = NSLock()
-    private var queue: AudioInputQueue?
+    private var queue: (any AudioIngestSink)?
     private var enabled = true
     /// LBC_TIMING 전용: 이 실행에서 오디오가 sink에 처음 닿은 벽시계 시각. 발화별
     /// 시작 시각은 이 값 + `chunk.start`(오디오 상대 시각)로 근사한다.
@@ -350,9 +442,9 @@ public final class AudioSinkGate: @unchecked Sendable {
 
     public init() {}
 
-    public func attach(_ queue: AudioInputQueue) {
+    public func attach(_ sink: any AudioIngestSink) {
         lock.lock(); defer { lock.unlock() }
-        self.queue = queue
+        self.queue = sink
     }
 
     public func disable() {
@@ -396,14 +488,20 @@ public struct TranscriptionChunk: Sendable, Equatable {
     public let end: Double
     public let runID: Int
     public let language: CaptionLanguage
+    /// final에만 값이 있다 — 자동 모드의 선택 규칙(스펙 §2)은 final의 평균 confidence만
+    /// 비교한다. 고정 모드에서도 계산은 되지만(트랜스크라이버 옵션이 모드와 무관하게
+    /// 하나라서) 아무도 읽지 않는다.
+    public let confidence: Double?
 
-    public init(text: String, isFinal: Bool, start: Double, end: Double, runID: Int, language: CaptionLanguage) {
+    public init(text: String, isFinal: Bool, start: Double, end: Double, runID: Int, language: CaptionLanguage,
+                confidence: Double? = nil) {
         self.text = text
         self.isFinal = isFinal
         self.start = start
         self.end = end
         self.runID = runID
         self.language = language
+        self.confidence = confidence
     }
 }
 
@@ -436,6 +534,105 @@ public protocol SpeechEngine: Sendable {
     func makeSession(locale: Locale, sensitivity: DetectorSensitivity) throws -> any SpeechSession
 }
 
+// MARK: - 자동 모드: 신뢰도 기반 언어 중재
+
+/// 언어별로 완전히 따로 도는 두 세션의 결과를 하나의 결과 스트림으로 합친다(스펙 §2).
+///
+/// 규칙: 발화 단위로 양쪽 final의 confidence(`TranscriptionChunk.confidence`, 이미 조각에
+/// 찍혀 있는 평균값)를 비교해 높은 쪽을 채택한다. partial 단계에서는 직전 발화의 승자
+/// 언어만 그대로 흘려보내고(진 쪽 partial은 버린다), final은 짝이 맞을 때(구간 시작 시각
+/// 차이가 `tolerance` 안쪽) 비교해 확정한다. 동점이거나 둘 다 confidence가 없으면 직전
+/// 승자를 유지한다.
+///
+/// 짝을 기다리는 final은 최대 하나(`awaiting`)만 들고 있는다. 그 짝이 영영 오지 않을 수
+/// 있는 두 경우 — 상대 쪽 스트림이 이미 끝났거나(`sideEnded`), 다음 final이 짝이 아닌 채로
+/// 도착하거나 — 에는 기다리던 쪽을 그대로 채택해 흘려보낸다. 그래서 한쪽이 멎어도(스펙 §2
+/// "한쪽 실패") 다른 쪽이 무한정 막히지 않는다.
+actor DualArbitrator {
+    enum Side: Sendable { case a, b }
+
+    private struct Pending {
+        let side: Side
+        let chunk: TranscriptionChunk
+    }
+
+    private let tolerance: Double
+    private let continuation: AsyncThrowingStream<TranscriptionChunk, any Error>.Continuation
+    private var winner: CaptionLanguage
+    private var awaiting: Pending?
+    private var ended: Set<Side> = []
+    private var lastError: (any Error)?
+
+    init(initialWinner: CaptionLanguage, tolerance: Double = 0.2,
+         continuation: AsyncThrowingStream<TranscriptionChunk, any Error>.Continuation) {
+        self.winner = initialWinner
+        self.tolerance = tolerance
+        self.continuation = continuation
+    }
+
+    func ingest(_ chunk: TranscriptionChunk, side: Side) {
+        LatencyTiming.log("[자동] \(chunk.language.displayName) 쪽 \(chunk.isFinal ? "final" : "partial") "
+            + "신뢰도=\(chunk.confidence.map { String(format: "%.3f", $0) } ?? "-") 구간=\(chunk.start)~\(chunk.end)")
+
+        guard chunk.isFinal else {
+            if chunk.language == winner { continuation.yield(chunk) }
+            return
+        }
+
+        if let pending = awaiting {
+            if pending.side != side, abs(pending.chunk.start - chunk.start) <= tolerance {
+                adopt(decide(pending.chunk, chunk))
+                awaiting = nil
+                return
+            }
+            // 짝이 아니다 — 같은 쪽이 또 냈거나 시간이 안 맞는다. 기다리던 것부터 흘려보낸다.
+            adopt(pending.chunk)
+            awaiting = nil
+        }
+
+        if ended.contains(opposite(of: side)) {
+            adopt(chunk) // 상대는 이미 끝났다 — 짝이 다시는 안 온다. 곧바로 채택한다.
+        } else {
+            awaiting = Pending(side: side, chunk: chunk)
+        }
+    }
+
+    /// 한쪽 세션의 결과 스트림이 끝났다(정상 종료거나 오류). 기다리던 짝이 있으면 곧바로
+    /// 흘려보낸다 — 다시는 짝이 올 수 없으므로. 둘 다 끝났으면 합류 스트림도 끝낸다.
+    func sideEnded(_ side: Side, error: (any Error)?) {
+        ended.insert(side)
+        if let error { lastError = error }
+        if let pending = awaiting {
+            adopt(pending.chunk)
+            awaiting = nil
+        }
+        if ended.count >= 2 {
+            if let lastError { continuation.finish(throwing: lastError) } else { continuation.finish() }
+        }
+    }
+
+    private func adopt(_ chunk: TranscriptionChunk) {
+        winner = chunk.language
+        continuation.yield(chunk)
+    }
+
+    private func opposite(of side: Side) -> Side { side == .a ? .b : .a }
+
+    /// 스펙 §2 선택 규칙: 둘 다 있으면 높은 쪽, 하나만 있으면 그쪽, 동점·둘 다 없으면
+    /// 직전 승자(`winner`, 이 비교 시점의 값)를 유지한다.
+    private func decide(_ a: TranscriptionChunk, _ b: TranscriptionChunk) -> TranscriptionChunk {
+        switch (a.confidence, b.confidence) {
+        case let (x?, y?):
+            if x > y { return a }
+            if y > x { return b }
+            return a.language == winner ? a : b
+        case (.some, nil): return a
+        case (nil, .some): return b
+        case (nil, nil): return a.language == winner ? a : b
+        }
+    }
+}
+
 // MARK: - 파이프라인
 
 /// 실행(Run) 하나의 자원을 소유한다. AppDelegate가 직접 부르지 않는다 —
@@ -455,6 +652,11 @@ public final class SpeechPipeline {
         var source: (any AudioSource)?
         var session: (any SpeechSession)?
         var queue: AudioInputQueue?
+        /// 자동 모드에서만 쓴다 — 부 언어 세션과 큐. 고정 모드에서는 항상 nil이다.
+        var secondarySession: (any SpeechSession)?
+        var secondaryQueue: AudioInputQueue?
+        /// 자동 모드에서 두 세션의 결과 스트림을 `DualArbitrator`로 실어 나르는 태스크.
+        var arbitrationTasks: [Task<Void, Never>] = []
         var resultsTask: Task<Void, Never>?
         var progressTask: Task<Void, Never>?
         var reservedLocales: [Locale] = []
@@ -534,6 +736,14 @@ public final class SpeechPipeline {
     // MARK: 시작 절차
 
     private func startRun(_ run: Run) async throws {
+        if let secondaryLanguage = run.configuration.secondaryLanguage {
+            try await startDualRun(run, secondaryLanguage: secondaryLanguage)
+        } else {
+            try await startFixedRun(run)
+        }
+    }
+
+    private func startFixedRun(_ run: Run) async throws {
         let language = run.configuration.language
 
         guard let locale = await engine.supportedLocale(equivalentTo: language.locale) else {
@@ -580,12 +790,111 @@ public final class SpeechPipeline {
         emit(run.id, .listening(language: run.language))
     }
 
-    private func installAssets(_ session: any SpeechSession, run: Run) async throws {
+    /// 자동 모드. 하드 제약(실측, 스펙 §2): 분석기 하나에 전사기 둘을 물리면 SIGTRAP —
+    /// 그래서 언어별로 분석기·전사기·pump를 완전히 별개로 두 벌 돌리고, 변환된 오디오만
+    /// `DualAudioSink`로 팬아웃한다. 두 세션의 결과는 `DualArbitrator`가 신뢰도로 골라
+    /// 하나의 스트림으로 합치고, 그 뒤로는 `consume(_:run:)`이 고정 모드와 똑같이 받는다 —
+    /// 발화 장부(ledger)·이벤트 스탬프 규칙이 갈라지지 않는다.
+    private func startDualRun(_ run: Run, secondaryLanguage: CaptionLanguage) async throws {
+        let primaryLanguage = run.configuration.language
+
+        guard let primaryLocale = await engine.supportedLocale(equivalentTo: primaryLanguage.locale) else {
+            throw PipelineError.unsupportedLanguage(primaryLanguage.displayName)
+        }
+        try checkAlive(run)
+        guard let secondaryLocale = await engine.supportedLocale(equivalentTo: secondaryLanguage.locale) else {
+            throw PipelineError.unsupportedLanguage(secondaryLanguage.displayName)
+        }
+        try checkAlive(run)
+
+        let sessionA = try engine.makeSession(locale: primaryLocale, sensitivity: run.configuration.sensitivity)
+        let sessionB = try engine.makeSession(locale: secondaryLocale, sensitivity: run.configuration.sensitivity)
+        run.session = sessionA
+        run.secondarySession = sessionB
+
+        try await installAssets(sessionA, run: run, progressRange: 0.0..<0.5)
+        try checkAlive(run)
+        try await installAssets(sessionB, run: run, progressRange: 0.5..<1.0)
+        try checkAlive(run)
+
+        await reserveIfNeeded(primaryLocale, run: run)
+        try checkAlive(run)
+        await reserveIfNeeded(secondaryLocale, run: run)
+        try checkAlive(run)
+
+        let gate = AudioSinkGate()
+        run.gate = gate
+        let source = makeSource(run.configuration.source)
+        run.source = source
+        let captureFormat = try await source.start { buffer in gate.ingest(buffer) }
+        try checkAlive(run)
+
+        var negotiatedA = await sessionA.bestAudioFormat(considering: captureFormat)
+        if negotiatedA == nil { negotiatedA = await sessionA.bestAudioFormat(considering: nil) }
+        guard let formatA = negotiatedA else { throw PipelineError.noCompatibleFormat }
+        try checkAlive(run)
+
+        var negotiatedB = await sessionB.bestAudioFormat(considering: captureFormat)
+        if negotiatedB == nil { negotiatedB = await sessionB.bestAudioFormat(considering: nil) }
+        guard let formatB = negotiatedB else { throw PipelineError.noCompatibleFormat }
+        try checkAlive(run)
+
+        // 두 벌이 서로 다른 분석 포맷을 요구하면 오디오를 두 번 변환해야 한다 — 이
+        // 기기에서는 한 번도 관찰되지 않았고(스펙 §2 하드 제약 실측 메모) 지원할 가치가
+        // 낮다. 다르면 시작에 실패한다(호출자가 실패로 보고한다).
+        guard formatA.sampleRate == formatB.sampleRate,
+              formatA.channelCount == formatB.channelCount,
+              formatA.commonFormat == formatB.commonFormat,
+              formatA.isInterleaved == formatB.isInterleaved
+        else { throw PipelineError.noCompatibleFormat }
+        let analysisFormat = formatA
+        LatencyTiming.log("자동 모드 협상된 분석 포맷(양쪽 공통): \(analysisFormat)")
+
+        let queueA = AudioInputQueue(analysisFormat: analysisFormat)
+        let queueB = AudioInputQueue(analysisFormat: analysisFormat)
+        run.queue = queueA
+        run.secondaryQueue = queueB
+        gate.attach(DualAudioSink(analysisFormat: analysisFormat, primary: queueA, secondary: queueB))
+
+        let streamA = try await sessionA.start(format: analysisFormat, input: queueA, runID: run.id, language: primaryLanguage)
+        try checkAlive(run)
+        let streamB = try await sessionB.start(format: analysisFormat, input: queueB, runID: run.id, language: secondaryLanguage)
+        try checkAlive(run)
+
+        let (merged, continuation) = AsyncThrowingStream<TranscriptionChunk, any Error>.makeStream()
+        let arbitrator = DualArbitrator(initialWinner: run.language, continuation: continuation)
+        let taskA = Task {
+            do {
+                for try await chunk in streamA { await arbitrator.ingest(chunk, side: .a) }
+                await arbitrator.sideEnded(.a, error: nil)
+            } catch {
+                await arbitrator.sideEnded(.a, error: error is CancellationError ? nil : error)
+            }
+        }
+        let taskB = Task {
+            do {
+                for try await chunk in streamB { await arbitrator.ingest(chunk, side: .b) }
+                await arbitrator.sideEnded(.b, error: nil)
+            } catch {
+                await arbitrator.sideEnded(.b, error: error is CancellationError ? nil : error)
+            }
+        }
+        run.arbitrationTasks = [taskA, taskB]
+
+        run.resultsTask = Task { [weak self] in
+            await self?.consume(merged, run: run)
+        }
+        run.listening = true
+        emit(run.id, .listening(language: run.language))
+    }
+
+    private func installAssets(_ session: any SpeechSession, run: Run, progressRange: Range<Double> = 0.0..<1.0) async throws {
         let (stream, continuation) = AsyncStream<Double>.makeStream()
         let reporter = Task { [weak self] in
             for await fraction in stream {
                 guard let self, self.current === run else { continue }
-                self.emit(run.id, .installing(fraction: fraction))
+                let scaled = progressRange.lowerBound + fraction * (progressRange.upperBound - progressRange.lowerBound)
+                self.emit(run.id, .installing(fraction: scaled))
             }
         }
         run.progressTask = reporter
@@ -673,17 +982,23 @@ public final class SpeechPipeline {
         run.gate?.disable()
         if let source = run.source { await source.stop() }
         run.queue?.finish()
+        run.secondaryQueue?.finish()
         run.progressTask?.cancel()
         run.resultsTask?.cancel()
+        for task in run.arbitrationTasks { task.cancel() }
         if let session = run.session { await session.finish() }
+        if let secondarySession = run.secondarySession { await secondarySession.finish() }
         for locale in run.reservedLocales { await engine.release(locale: locale) }
 
         run.gate = nil
         run.source = nil
         run.queue = nil
+        run.secondaryQueue = nil
         run.session = nil
+        run.secondarySession = nil
         run.progressTask = nil
         run.resultsTask = nil
+        run.arbitrationTasks = []
         run.reservedLocales = []
 
         if current === run { current = nil }
@@ -786,7 +1101,10 @@ actor SystemSpeechSession: SpeechSession {
             // SpeechTranscriber.ReportingOption에 있는 걸 확인했다(DictationTranscriber의
             // .frequentFinalization과 혼동하지 말 것).
             reportingOptions: [.volatileResults, .fastResults],
-            attributeOptions: [])
+            // 자동 모드의 신뢰도 비교(스펙 §2)에 쓴다. 고정 모드에서는 계산만 되고
+            // 아무도 읽지 않는다 — 세션 생성 경로를 자동/고정으로 가르지 않으려고
+            // 항상 켠다.
+            attributeOptions: [.transcriptionConfidence])
     }
 
     private var modules: [any SpeechModule] { [detector, transcriber] }
@@ -902,13 +1220,23 @@ actor SystemSpeechSession: SpeechSession {
                         start: result.range.start.seconds,
                         end: result.range.end.seconds,
                         runID: runID,
-                        language: language))
+                        language: language,
+                        confidence: result.isFinal ? Self.meanConfidence(result.text) : nil))
                 }
             } catch {
                 guard !Task.isCancelled else { return }
                 sink?.finish(throwing: error)
             }
         }
+    }
+
+    /// `result.text.runs`에 달린 `AttributeScopes.SpeechAttributes.ConfidenceAttribute`의
+    /// 평균. 런이 하나도 없으면(속성이 안 붙는 드문 경우) nil — 자동 모드 선택 규칙(스펙
+    /// §2)은 nil을 "낮음"으로 다룬다.
+    private static func meanConfidence(_ text: AttributedString) -> Double? {
+        let values = text.runs.compactMap { $0.attributes[AttributeScopes.SpeechAttributes.ConfidenceAttribute.self] }
+        guard !values.isEmpty else { return nil }
+        return values.reduce(0, +) / Double(values.count)
     }
 
     private func fail(_ error: any Error) {

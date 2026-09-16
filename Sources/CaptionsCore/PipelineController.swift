@@ -68,10 +68,14 @@ public final class PipelineController {
 
             // 언어만 바뀌었고 이미 듣고 있으면 실행을 끊지 않고 모듈만 교체한다.
             // 민감도나 소스가 바뀌면 모듈 구성 자체가 달라지므로 재시작한다.
+            // secondaryLanguage가 같아야만 hot swap을 시도한다 — 모드 자체가 바뀌면
+            // (고정↔자동) 언어 값이 같아도 세션 구성(한 벌 vs 두 벌)이 통째로 달라져서
+            // switchLanguage가 다룰 수 있는 범위를 벗어난다. 그런 변경은 재시작이다.
             if let target, let live,
                live.source == target.source,
                live.sensitivity == target.sensitivity,
                live.language != target.language,
+               live.secondaryLanguage == target.secondaryLanguage,
                pipeline.isListening {
                 attempted = target
                 if await pipeline.switchLanguage(to: target.language, generation: generationAtStart) {

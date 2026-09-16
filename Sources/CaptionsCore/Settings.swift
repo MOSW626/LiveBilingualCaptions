@@ -48,7 +48,7 @@ public struct Settings: Codable, Equatable, Sendable {
     public static let captionHistoryCountRange = 1...10
 
     public static let `default` = Settings(
-        languageMode: .fixed("ko-KR"),
+        languageMode: .auto,
         preferredTargetID: nil,
         audioSource: .microphone,
         fontSize: 20,

@@ -40,7 +40,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     /// 마지막으로 자막이 갱신된 시각. 유지 시간 설정이 바뀌었을 때 "얼마나 지났는지"를
     /// 계산하는 기준이다. 지울 자막이 없으면(타이머가 없으면) nil이다.
     private var lastCaptionUpdate: Date?
-    /// 자동 모드는 실험 기능이다. 최초 언어는 한국어, 고정 모드는 저장한 ID를 쓴다.
+    /// 자동 모드의 최초(추정) 언어는 한국어, 고정 모드는 저장한 ID를 쓴다. 자동 모드가
+    /// 듣는 중에는 실제 채택 언어를 전사 이벤트(`event.sourceLanguage`)가 갱신한다 —
+    /// `SpeechPipeline`이 두 언어를 동시에 인식해 신뢰도로 고른 값이다(스펙 §2).
     private var currentLanguage: CaptionLanguage = .korean {
         didSet { syncLanguage() }
     }
@@ -48,9 +50,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var languageMode: LanguageMode { settingsStore.value.languageMode }
 
     /// 설정에서 만든 소스·언어·민감도의 스냅샷. 모든 시작/재구성이 이 경로를 지난다.
+    /// 자동 모드에서는 `secondaryLanguage`에 나머지 한 언어를 실어, 파이프라인이 두 벌을
+    /// 동시에 돌리게 한다(한국어/영어 두 언어만 다루므로 고정 쌍이다).
     private var currentConfiguration: PipelineConfiguration {
-        PipelineConfiguration(source: settingsStore.value.audioSource, language: currentLanguage,
-                              sensitivity: settingsStore.value.detectorSensitivity)
+        let secondary: CaptionLanguage?
+        if case .auto = languageMode {
+            secondary = currentLanguage == .korean ? .english : .korean
+        } else {
+            secondary = nil
+        }
+        return PipelineConfiguration(source: settingsStore.value.audioSource, language: currentLanguage,
+                                      sensitivity: settingsStore.value.detectorSensitivity,
+                                      secondaryLanguage: secondary)
     }
 
     func applicationDidFinishLaunching(_ notification: Notification) {
@@ -92,8 +103,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         refreshLanguagePairAvailability()
     }
 
-    /// languageMode 에서 파생되는 인식 언어. 자동 모드의 시작 언어는 항상 한국어다 —
-    /// 실험 기능이라 확신이 설 때까지는 안정적인 기본값에서 출발한다.
+    /// languageMode 에서 파생되는 인식 언어. 자동 모드의 시작(추정) 언어는 항상 한국어다 —
+    /// 실제로는 두 언어를 동시에 듣기 시작하고, 첫 발화가 확정되면 신뢰도가 이 값을 갈아친다.
     private func resolveCurrentLanguage(for mode: LanguageMode) -> CaptionLanguage {
         switch mode {
         case .auto: .korean
@@ -108,7 +119,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         state.targetLanguage = LanguageTable.default.target(
             for: currentLanguage, preferredID: settingsStore.value.preferredTargetID) ?? .english
         switch languageMode {
-        case .auto: state.languageTitle = "자동 (실험)"
+        case .auto: state.languageTitle = "자동"
         case .fixed(let id): state.languageTitle = LanguageTable.default.language(id: id)?.displayName ?? id
         }
     }
@@ -284,6 +295,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     private func show(_ event: TranscriptEvent, runID: Int) {
+        // 자동 모드에서는 SpeechPipeline이 두 언어를 동시에 인식해 신뢰도로 고른 언어를
+        // 이벤트에 이미 찍어 보낸다(스펙 §2) — 여기서는 그 값을 그대로 따라가 화면
+        // 상태만 갱신한다. 텍스트를 보고 언어를 다시 추측하지 않는다(§2 배경: 문자열
+        // 분류는 엉뚱한 전사기가 만든 글자를 못 구해낸다). requestReconfigure도 부르지
+        // 않는다 — 인식 자체는 이미 두 벌이 돌고 있어서 재시작이 필요 없다.
+        if case .auto = languageMode, currentLanguage != event.sourceLanguage {
+            currentLanguage = event.sourceLanguage
+            refreshLanguagePairAvailability()
+            if running { updateListeningStatus() }
+        }
+
         // 목록 규칙(추가 vs 갱신, 옛 줄 찾아가기, 트리밍, 문장 쪼개기)은 전부
         // CaptionState 에 있다. 여기는 글루다 — 화면을 비우는 판단이 이 경로에 끼어들
         // 자리가 없다. 빈 배열은 이미 밀려난 옛 발화의 갱신이라는 뜻이고, 그러면
@@ -302,26 +324,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
         // 말이 이어지는 동안에는 지우기 타이머를 계속 뒤로 민다.
         scheduleCaptionClear()
-
-        if case .auto = languageMode, event.isFinal {
-            proposeAutomaticLanguage(for: event.text)
-        }
-    }
-
-    /// 자동 전환은 실험 기능이다. 제안만 하고 실행은 반드시 controller를 거친다.
-    ///
-    /// 여기서 translator.reset()을 부르지 않는다: 이 함수는 방금 이 이벤트에 대해
-    /// submit()이 이미 끝난 뒤에 호출된다(위 show() 참고). 그 submit은 이벤트에 고정된
-    /// event.sourceLanguage를 썼으므로 이미 올바르다 — reset()을 부르면 방금 막 등록한
-    /// 정당한 번역 요청 자체를 취소해버린다. currentLanguage는 다음 발화의 인식 엔진
-    /// 설정에만 영향을 주고, 다음 발화는 어차피 새 captionID로 새 submit()을 타므로
-    /// 이전 세대는 자연히 무효화된다.
-    private func proposeAutomaticLanguage(for text: String) {
-        let detected = LanguageTable.default.detect(text, current: currentLanguage)
-        guard detected != currentLanguage else { return }
-        currentLanguage = detected
-        refreshLanguagePairAvailability()
-        controller.requestReconfigure(configuration: currentConfiguration)
     }
 
     /// `LSUIElement`라 Dock 아이콘이 없다 — 설정은 메뉴바에서 연다.
@@ -555,7 +557,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private func updateListeningStatus() {
         let mode: String
         switch languageMode {
-        case .auto: mode = "자동 (실험) · \(currentLanguage.displayName)"
+        case .auto: mode = "자동 · \(currentLanguage.displayName)"
         case .fixed: mode = currentLanguage.displayName
         }
         state.status = "● 듣는 중 · \(mode)"

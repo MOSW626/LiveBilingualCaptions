@@ -37,15 +37,16 @@ struct SettingsView: View {
             }
             Section("언어") {
                 Picker("인식 언어", selection: languageSelection) {
-                    Text("자동 (실험)").tag("auto")
+                    Text("자동").tag("auto")
                     ForEach(table.languages) { language in
                         Text(language.displayName).tag(language.id)
                             .disabled(availability.disabledLanguageIDs.contains(language.id))
                     }
                 }
-                // 자동 감지는 장식이 아니라 실제로 신뢰도가 낮다 — 오인식된 한두 단어로
-                // 언어를 잘못 판단할 수 있다. 기본값이 한국어 고정인 이유이기도 하다.
-                Text("자동 모드는 잘못 인식된 문장으로 언어를 판단할 수 있습니다. 정확한 전환은 언어를 직접 선택하세요.")
+                // 자동 모드는 문장을 보고 언어를 추측하지 않는다 — 한국어·영어 인식을
+                // 동시에 돌려 신뢰도가 높은 쪽을 그때그때 채택한다. 정확하지만 연산은
+                // 배로 든다.
+                Text("자동 모드는 한국어·영어 인식을 동시에 돌려 신뢰도가 높은 쪽을 채택합니다. 연산을 두 배로 씁니다.")
                     .font(.caption)
                     .foregroundStyle(.secondary)
                 if table.languages.count >= 3 {

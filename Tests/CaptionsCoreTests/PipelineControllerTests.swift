@@ -338,12 +338,14 @@ final class FakeSpeechSession: SpeechSession, @unchecked Sendable {
     }
 
     /// 분석기가 결과를 내보내는 것을 흉내낸다. runID·language는 지금 세션이 찍고 있는
-    /// "생산 시점" 값을 그대로 쓴다(실제 세션의 pump와 같은 계약).
-    func emit(_ text: String, isFinal: Bool, start: Double, end: Double) {
+    /// "생산 시점" 값을 그대로 쓴다(실제 세션의 pump와 같은 계약). confidence는 자동
+    /// 모드 신뢰도 비교(스펙 §2) 테스트에서만 쓴다 — 그 외엔 nil로 둬도 된다.
+    func emit(_ text: String, isFinal: Bool, start: Double, end: Double, confidence: Double? = nil) {
         let snapshot = state.wrapped
         snapshot.continuation?.yield(
             TranscriptionChunk(text: text, isFinal: isFinal, start: start, end: end,
-                                runID: snapshot.currentRunID, language: snapshot.currentLanguage))
+                                runID: snapshot.currentRunID, language: snapshot.currentLanguage,
+                                confidence: confidence))
     }
 
     func emitFailure(_ error: any Error) {
@@ -438,6 +440,9 @@ struct Harness {
 
 let koreanConfig = PipelineConfiguration(source: .microphone, language: .korean, sensitivity: .medium)
 let englishConfig = PipelineConfiguration(source: .microphone, language: .english, sensitivity: .medium)
+/// 자동 모드 — 한국어를 주 언어로, 영어를 부 언어로 동시에 돌린다(스펙 §2).
+let autoConfig = PipelineConfiguration(source: .microphone, language: .korean, sensitivity: .medium,
+                                       secondaryLanguage: .english)
 
 // MARK: - A. 포맷 협상과 백프레셔
 
@@ -1143,4 +1148,131 @@ let englishConfig = PipelineConfiguration(source: .microphone, language: .englis
     #expect(translated[originalID] == "번역:전환 직전 문장") // 번역도 그 줄에 붙는다
 
     await harness.waitForEvent { $0.kind == .listening(language: .english) }
+}
+
+// MARK: - E. 자동 모드 — 두 세션 신뢰도 중재 (2026-09-17 야간 §2)
+//
+// 자동 모드는 한 실행 안에서 세션을 **두 벌** 만든다(하드 제약: 분석기 하나에 전사기
+// 둘은 SIGTRAP). `harness.engine.sessions.wrapped[0]`이 주 언어(한국어), `[1]`이 부
+// 언어(영어)다 — startDualRun이 그 순서로 만든다.
+
+@Test @MainActor func 자동_모드는_세션을_두_벌_만든다() async {
+    let harness = Harness()
+    harness.controller.requestStart(configuration: autoConfig)
+    await harness.waitUntilListening()
+
+    #expect(harness.engine.sessions.wrapped.count == 2)
+    #expect(harness.engine.sessions.wrapped[0].locale.identifier == "ko-KR")
+    #expect(harness.engine.sessions.wrapped[1].locale.identifier == "en-US")
+}
+
+@Test @MainActor func 자동_모드에서_신뢰도가_높은_쪽이_채택되고_진_쪽은_버려진다() async {
+    let harness = Harness()
+    harness.controller.requestStart(configuration: autoConfig)
+    await harness.waitUntilListening()
+    let ko = harness.engine.sessions.wrapped[0]
+    let en = harness.engine.sessions.wrapped[1]
+
+    ko.emit("안녕하세요", isFinal: true, start: 0, end: 1, confidence: 0.4)
+    en.emit("annyeonghaseyo", isFinal: true, start: 0, end: 1, confidence: 0.9)
+
+    await harness.waitForEvent {
+        if case .transcript(let e) = $0.kind { return e.isFinal }
+        return false
+    }
+
+    let finals = harness.transcripts.filter(\.isFinal)
+    #expect(finals.count == 1) // 진 쪽(한국어)의 줄은 CaptionState까지 절대 오지 않는다
+    #expect(finals[0].sourceLanguage == .english)
+    #expect(finals[0].text == "annyeonghaseyo")
+}
+
+@Test @MainActor func 자동_모드에서_동점이면_직전_승자를_유지한다() async {
+    let harness = Harness()
+    harness.controller.requestStart(configuration: autoConfig)
+    await harness.waitUntilListening()
+    let ko = harness.engine.sessions.wrapped[0]
+    let en = harness.engine.sessions.wrapped[1]
+
+    // 첫 발화: 한국어가 이긴다 — 이후 "직전 승자"가 된다.
+    ko.emit("첫 문장", isFinal: true, start: 0, end: 1, confidence: 0.9)
+    en.emit("first", isFinal: true, start: 0, end: 1, confidence: 0.2)
+    await harness.waitForEvent {
+        if case .transcript(let e) = $0.kind { return e.text == "첫 문장" }
+        return false
+    }
+
+    // 두 번째 발화: 신뢰도가 동점이다 — 직전 승자(한국어)를 유지해야 한다.
+    ko.emit("두번째", isFinal: true, start: 3, end: 4, confidence: 0.5)
+    en.emit("second", isFinal: true, start: 3, end: 4, confidence: 0.5)
+    await harness.waitForEvent {
+        if case .transcript(let e) = $0.kind { return e.text == "두번째" }
+        return false
+    }
+
+    let finals = harness.transcripts.filter(\.isFinal)
+    #expect(finals.count == 2)
+    #expect(finals[1].sourceLanguage == .korean)
+    #expect(finals[1].text == "두번째")
+}
+
+@Test @MainActor func 자동_모드에서_한쪽이_실패해도_다른_쪽은_막히지_않는다() async {
+    let harness = Harness()
+    harness.controller.requestStart(configuration: autoConfig)
+    await harness.waitUntilListening()
+    let ko = harness.engine.sessions.wrapped[0]
+    let en = harness.engine.sessions.wrapped[1]
+
+    ko.emitFailure(TestError.startFailed) // 한국어 쪽 결과 스트림이 죽는다
+
+    en.emit("still working", isFinal: true, start: 0, end: 1, confidence: 0.7)
+    await harness.waitForEvent {
+        if case .transcript(let e) = $0.kind { return e.text == "still working" }
+        return false
+    }
+
+    let finals = harness.transcripts.filter(\.isFinal)
+    #expect(finals.contains { $0.text == "still working" && $0.sourceLanguage == .english })
+    #expect(harness.controller.state == .listening) // 한쪽 실패가 전체 실행을 넘어뜨리지 않는다
+
+    // 산 쪽이 계속 final을 내도 죽은 상대를 기다리며 막히지 않고 계속 흘러간다.
+    en.emit("still working two", isFinal: true, start: 3, end: 4, confidence: 0.7)
+    await harness.waitForEvent {
+        if case .transcript(let e) = $0.kind { return e.text == "still working two" }
+        return false
+    }
+}
+
+@Test @MainActor func 자동_모드에서_진_쪽의_partial은_화면에_나타나지_않는다() async {
+    let harness = Harness()
+    harness.controller.requestStart(configuration: autoConfig)
+    await harness.waitUntilListening()
+    let ko = harness.engine.sessions.wrapped[0]
+    let en = harness.engine.sessions.wrapped[1]
+
+    // 아직 아무 발화도 확정되지 않았다 — "직전 승자"는 설정된 주 언어(한국어)다.
+    ko.emit("듣는 중", isFinal: false, start: 0, end: 0.5)
+    en.emit("listening", isFinal: false, start: 0, end: 0.5)
+    await harness.waitForEvent {
+        if case .transcript(let e) = $0.kind { return e.text == "듣는 중" }
+        return false
+    }
+
+    #expect(harness.transcripts.map(\.text) == ["듣는 중"]) // 영어 partial은 버려졌다
+}
+
+@Test @MainActor func 고정_모드는_자동_모드_도입_뒤에도_그대로다() async {
+    // 고정 모드는 여전히 세션 하나만 만들고, confidence 필드는 아무 영향이 없다.
+    let harness = Harness()
+    harness.controller.requestStart(configuration: koreanConfig)
+    await harness.waitUntilListening()
+
+    #expect(harness.engine.sessions.wrapped.count == 1)
+    let session = harness.engine.sessions.wrapped[0]
+    session.emit("고정 모드 문장", isFinal: true, start: 0, end: 1)
+    await harness.waitForEvent {
+        if case .transcript(let e) = $0.kind { return e.text == "고정 모드 문장" }
+        return false
+    }
+    #expect(harness.transcripts.map(\.text) == ["고정 모드 문장"])
 }
