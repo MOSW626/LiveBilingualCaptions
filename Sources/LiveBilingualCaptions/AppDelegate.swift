@@ -1,7 +1,16 @@
 import AppKit
 import AVFoundation
+import Observation
 import SwiftUI
 import CaptionsCore
+
+/// Binding 하나로 설정 창과 AppDelegate가 같은 값을 본다. 대입 경로는 `AppDelegate.apply(_:)`
+/// 하나뿐이다 — 이 프로퍼티를 직접 바꾸지 않는다.
+@Observable
+@MainActor
+final class SettingsStore {
+    var value = Settings.load(from: .standard)
+}
 
 @MainActor
 final class AppDelegate: NSObject, NSApplicationDelegate {
@@ -14,30 +23,41 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }))
     private let translator = Translator(table: .default)
-    private var settings = Settings.default
+    private let settingsStore = SettingsStore()
+    private let availability = LanguageAvailabilityState()
+    private var statusItem: NSStatusItem?
+    private var settingsWindow: NSWindow?
+    private var moveObserver: NSObjectProtocol?
+    private var resizeObserver: NSObjectProtocol?
     private var running = false
     private var clearTask: Task<Void, Never>?
+    /// 마지막으로 자막이 갱신된 시각. 유지 시간 설정이 바뀌었을 때 "얼마나 지났는지"를
+    /// 계산하는 기준이다. 지울 자막이 없으면(타이머가 없으면) nil이다.
+    private var lastCaptionUpdate: Date?
     /// 자동 모드는 실험 기능이다. 최초 언어는 한국어, 고정 모드는 저장한 ID를 쓴다.
-    private var languageMode: LanguageMode = .fixed(CaptionLanguage.korean.id) {
-        didSet { syncLanguage() }
-    }
     private var currentLanguage: CaptionLanguage = .korean {
         didSet { syncLanguage() }
     }
-    private var sensitivity: DetectorSensitivity = .medium
-    private var audioSourceKind: AudioSourceKind = .microphone
-    private var captionHoldSeconds: Double = 10
+
+    private var languageMode: LanguageMode { settingsStore.value.languageMode }
 
     /// 설정에서 만든 소스·언어·민감도의 스냅샷. 모든 시작/재구성이 이 경로를 지난다.
     private var currentConfiguration: PipelineConfiguration {
-        PipelineConfiguration(source: audioSourceKind, language: currentLanguage, sensitivity: sensitivity)
+        PipelineConfiguration(source: settingsStore.value.audioSource, language: currentLanguage,
+                              sensitivity: settingsStore.value.detectorSensitivity)
     }
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         applyStoredSettings()
         buildWindow()
+        buildStatusItem()
         bindController()
         requestPermissionsAndStart()
+    }
+
+    func applicationWillTerminate(_ notification: Notification) {
+        if let moveObserver { NotificationCenter.default.removeObserver(moveObserver) }
+        if let resizeObserver { NotificationCenter.default.removeObserver(resizeObserver) }
     }
 
     private func bindController() {
@@ -54,22 +74,22 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     /// 저장된 설정에서 언어·소스·민감도를 읽어 온다. 고정 모드의 ID가 곧 시작 언어이고,
     /// 자동 모드의 최초 언어는 한국어다.
     private func applyStoredSettings() {
-        settings = Settings.load(from: .standard)
-        audioSourceKind = settings.audioSource
-        state.audioSourceName = audioSourceKind.displayName
-        sensitivity = settings.detectorSensitivity
-        captionHoldSeconds = settings.captionHoldSeconds
+        let settings = settingsStore.value
         state.fontSize = settings.fontSize
         state.historyCount = settings.captionHistoryCount
+        state.audioSourceName = settings.audioSource.displayName
         translator.preferredTargetID = settings.preferredTargetID
-        languageMode = settings.languageMode
-        if case .fixed(let id) = settings.languageMode,
-           let language = LanguageTable.default.language(id: id) {
-            currentLanguage = language
-        } else {
-            currentLanguage = .korean
+        currentLanguage = resolveCurrentLanguage(for: settings.languageMode) // didSet이 syncLanguage()를 부른다
+        refreshLanguagePairAvailability()
+    }
+
+    /// languageMode 에서 파생되는 인식 언어. 자동 모드의 시작 언어는 항상 한국어다 —
+    /// 실험 기능이라 확신이 설 때까지는 안정적인 기본값에서 출발한다.
+    private func resolveCurrentLanguage(for mode: LanguageMode) -> CaptionLanguage {
+        switch mode {
+        case .auto: .korean
+        case .fixed(let id): LanguageTable.default.language(id: id) ?? .korean
         }
-        syncLanguage()
     }
 
     /// 언어 관련 화면 상태는 한곳에서만 갱신한다. 번역 대상은 테이블이 정한다 —
@@ -77,7 +97,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private func syncLanguage() {
         state.sourceLanguage = currentLanguage
         state.targetLanguage = LanguageTable.default.target(
-            for: currentLanguage, preferredID: settings.preferredTargetID) ?? .english
+            for: currentLanguage, preferredID: settingsStore.value.preferredTargetID) ?? .english
         switch languageMode {
         case .auto: state.languageTitle = "자동 (실험)"
         case .fixed(let id): state.languageTitle = LanguageTable.default.language(id: id)?.displayName ?? id
@@ -109,6 +129,53 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
         state.isRunning = running
         state.canToggle = true
+    }
+
+    /// 설정 창·오버레이 버튼 어느 쪽에서 온 변경이든 지나는 **하나뿐인** 적용 경로.
+    /// 판단(무엇이 바뀌었는지, 재구성이 필요한지)은 `applySettingsChange`(CaptionsCore)가
+    /// 순수하게 하고, 여기서는 그 결과를 받아 저장·화면 갱신·후속 작업만 한다.
+    @discardableResult
+    private func apply(_ new: CaptionsCore.Settings) -> Bool {
+        let old = settingsStore.value
+        guard old != new else { return false }
+
+        if new.languageMode != old.languageMode {
+            currentLanguage = resolveCurrentLanguage(for: new.languageMode)
+        }
+        settingsStore.value = new
+        new.save(to: .standard)
+
+        state.fontSize = new.fontSize
+        state.historyCount = new.captionHistoryCount
+        state.audioSourceName = new.audioSource.displayName
+        translator.preferredTargetID = new.preferredTargetID
+        syncLanguage() // preferredTargetID만 바뀌어도 대상 언어가 달라질 수 있다
+
+        let result = applySettingsChange(old: old, new: new, running: running,
+                                         configuration: currentConfiguration, controller: controller)
+        if result.captureChanged || result.pairChanged {
+            invalidateCaptions()
+        }
+        if result.pairChanged {
+            refreshLanguagePairAvailability()
+        }
+        if result.holdChanged {
+            rescheduleCaptionClear()
+        }
+        return result.didReconfigure
+    }
+
+    /// 음성 locale 지원 여부와 번역의 방향별 상태를 조회해 설정 창의 비활성/다운로드 안내를
+    /// 갱신한다. 세대 관리는 `LanguageAvailabilityState` 안에서 한다.
+    private func refreshLanguagePairAvailability() {
+        let table = LanguageTable.default
+        let source = currentLanguage
+        let preferredID = settingsStore.value.preferredTargetID
+        Task { [weak self] in
+            await self?.availability.refresh(
+                source: source, table: table, preferredTargetID: preferredID,
+                packStatus: { await Translator.packStatus(from: $0, to: $1) })
+        }
     }
 
     private func handle(_ event: PipelineEvent) {
@@ -152,14 +219,55 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let detected = LanguageTable.default.detect(text, current: currentLanguage)
         guard detected != currentLanguage else { return }
         currentLanguage = detected
+        refreshLanguagePairAvailability()
         controller.requestReconfigure(configuration: currentConfiguration)
     }
 
+    /// `LSUIElement`라 Dock 아이콘이 없다 — 설정은 메뉴바에서 연다.
+    private func buildStatusItem() {
+        let item = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
+        item.button?.title = "자막"
+        let menu = NSMenu()
+        menu.addItem(NSMenuItem(title: "설정…", action: #selector(showSettings), keyEquivalent: ","))
+        menu.addItem(.separator())
+        menu.addItem(NSMenuItem(title: "종료", action: #selector(quitApp), keyEquivalent: "q"))
+        menu.items.forEach { $0.target = self }
+        item.menu = menu
+        statusItem = item
+    }
+
+    @objc private func showSettings() {
+        if let settingsWindow {
+            settingsWindow.makeKeyAndOrderFront(nil)
+            NSApp.activate()
+            return
+        }
+        let view = SettingsView(
+            settings: Binding(get: { self.settingsStore.value }, set: { self.apply($0) }),
+            table: .default,
+            availability: availability)
+        let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 420, height: 480),
+                              styleMask: [.titled, .closable], backing: .buffered, defer: false)
+        window.title = "Live Bilingual Captions 설정"
+        window.isReleasedWhenClosed = false // 닫아도 재사용한다 — 매번 새로 만들지 않는다
+        window.contentView = NSHostingView(rootView: view)
+        window.center()
+        window.makeKeyAndOrderFront(nil)
+        NSApp.activate()
+        settingsWindow = window
+    }
+
     private func buildWindow() {
-        let width = settings.panelWidth ?? 560
-        let size = NSSize(width: width, height: settings.panelHeight ?? 188)
-        panel = NSPanel(contentRect: NSRect(origin: .zero, size: size),
-                        styleMask: [.borderless],
+        let stored = settingsStore.value
+        let screen = screenContaining(x: stored.panelOriginX, y: stored.panelOriginY) ?? NSScreen.main
+        let frame: CGRect = if let screen {
+            PanelFrame.restoredFrame(storedOriginX: stored.panelOriginX, storedOriginY: stored.panelOriginY,
+                                     storedWidth: stored.panelWidth, visibleFrame: screen.visibleFrame)
+        } else {
+            CGRect(x: 0, y: 0, width: PanelFrame.defaultWidth, height: PanelFrame.minHeight)
+        }
+
+        panel = NSPanel(contentRect: frame, styleMask: [.borderless, .resizable],
                         backing: .buffered, defer: false)
         // 발표·전체화면 위에도 자막이 보여야 한다.
         panel.level = .screenSaver
@@ -183,25 +291,55 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             onQuit: { [weak self] in self?.quitApp() },
             onHeight: { [weak self] height in self?.fitPanel(toContentHeight: height) })
         let hosting = NSHostingView(rootView: overlay)
-        hosting.frame = NSRect(origin: .zero, size: size)
+        hosting.frame = NSRect(origin: .zero, size: frame.size)
         panel.contentView = hosting
 
-        if let screen = NSScreen.main {
-            let x = settings.panelOriginX ?? (screen.visibleFrame.midX - size.width / 2)
-            let y = settings.panelOriginY ?? (screen.visibleFrame.minY + 54)
-            panel.setFrameOrigin(NSPoint(x: x, y: y))
-        }
         panel.orderFrontRegardless()
         NSApp.activate()
+        // 복원이 끝난 뒤에 구독한다 — 초기 setFrame이 방금 읽은 저장값을 덮어쓰지 않게.
+        observePanelGeometry()
     }
 
-    /// 자막이 쌓이면 창이 위로 자라야 한다. NSWindow 는 좌상단을 고정한 채 커지므로
-    /// 높이만 바꾸면 자막이 화면 아래로 밀린다 — 좌하단(minY)을 고정해 위로 키운다.
+    /// 저장된 원점을 담고 있는 화면을 찾는다. 값이 없거나 유효하지 않거나, 그 화면이
+    /// 더 이상 연결돼 있지 않으면 nil — 호출자가 기본 화면으로 대체한다.
+    private func screenContaining(x: Double?, y: Double?) -> NSScreen? {
+        guard let x, let y, x.isFinite, y.isFinite else { return nil }
+        let point = CGPoint(x: x, y: y)
+        return NSScreen.screens.first { $0.frame.contains(point) }
+    }
+
+    private func observePanelGeometry() {
+        let handler: @Sendable (Notification) -> Void = { [weak self] _ in
+            Task { @MainActor [weak self] in self?.persistPanelGeometry() }
+        }
+        moveObserver = NotificationCenter.default.addObserver(
+            forName: NSWindow.didMoveNotification, object: panel, queue: .main, using: handler)
+        resizeObserver = NotificationCenter.default.addObserver(
+            forName: NSWindow.didResizeNotification, object: panel, queue: .main, using: handler)
+    }
+
+    /// 위치와 너비만 저장한다 — 높이는 자동 성장이 정하므로(Task 7) 저장 대상이 아니다.
+    /// 이 경로로도 `apply(_:)`를 거치므로 값이 실제로 안 바뀌었으면(예: 높이만 변한 리사이즈)
+    /// 아무 일도 하지 않는다.
+    private func persistPanelGeometry() {
+        guard let panel else { return }
+        var updated = settingsStore.value
+        updated.panelOriginX = panel.frame.origin.x
+        updated.panelOriginY = panel.frame.origin.y
+        updated.panelWidth = panel.frame.width
+        apply(updated)
+    }
+
+    /// 자막이 쌓이면 창이 위로 자라야 한다. `PanelFrame.clamped`가 화면 밖으로 넘치지
+    /// 않게 막는다 — 화면 위쪽에 붙은 패널이 무한정 자라 사라지는 일을 막는다.
     private func fitPanel(toContentHeight height: CGFloat) {
         guard let panel, height > 0, abs(panel.frame.height - height) > 0.5 else { return }
-        let frame = NSRect(x: panel.frame.minX, y: panel.frame.minY,
-                           width: panel.frame.width, height: height)
-        panel.setFrame(frame, display: true)
+        let visibleFrame = (panel.screen ?? NSScreen.main)?.visibleFrame ?? panel.frame
+        let clampedFrame = PanelFrame.clamped(
+            origin: panel.frame.origin,
+            size: CGSize(width: panel.frame.width, height: height),
+            visibleFrame: visibleFrame)
+        panel.setFrame(clampedFrame, display: true)
     }
 
     private func requestPermissionsAndStart() {
@@ -232,45 +370,37 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private func invalidateCaptions() {
         clearTask?.cancel()
         clearTask = nil
+        lastCaptionUpdate = nil
         translator.reset()
         // 장부만 비운다. 화면의 자막은 남긴다 — 정지했다고 읽던 줄을 뺏지 않는다.
         state.resetLedger()
     }
 
-    private func quitApp() {
+    @objc private func quitApp() {
         stopListening()
         NSApp.terminate(nil)
     }
 
-    /// 수동 한국어/영어 전환과 설정의 fixed ID가 같은 configuration 경로를 탄다.
+    /// 수동 한국어/영어 전환과 설정의 fixed ID가 같은 configuration 경로를 탄다 —
+    /// 둘 다 `apply(_ new: Settings)` 하나를 거친다.
     private func cycleLanguage() {
+        var new = settingsStore.value
         switch languageMode {
         case .auto:
-            languageMode = .fixed(CaptionLanguage.korean.id)
-            currentLanguage = .korean
+            new.languageMode = .fixed(CaptionLanguage.korean.id)
         case .fixed(let id) where id == CaptionLanguage.korean.id:
-            languageMode = .fixed(CaptionLanguage.english.id)
-            currentLanguage = .english
+            new.languageMode = .fixed(CaptionLanguage.english.id)
         case .fixed:
-            languageMode = .auto
-            currentLanguage = .korean
+            new.languageMode = .auto
         }
-        if running {
-            translator.reset() // 언어쌍이 바뀌므로 진행 중이던 번역·보정은 무효화한다.
-            controller.requestReconfigure(configuration: currentConfiguration)
-        }
+        apply(new)
     }
 
-    /// 마이크/시스템 오디오 전환도 언어 전환과 같은 경로를 탄다 — `currentConfiguration`
-    /// 스냅샷을 바꾸고 controller에 재구성을 요청한다. 소스 변경은 모듈 구성 자체가
-    /// 달라지므로(PipelineController 참고) 항상 재시작이다.
+    /// 마이크/시스템 오디오 전환도 언어 전환과 같은 경로를 탄다.
     private func cycleAudioSource() {
-        audioSourceKind = audioSourceKind == .microphone ? .systemAudio : .microphone
-        state.audioSourceName = audioSourceKind.displayName
-        if running {
-            translator.reset()
-            controller.requestReconfigure(configuration: currentConfiguration)
-        }
+        var new = settingsStore.value
+        new.audioSource = new.audioSource == .microphone ? .systemAudio : .microphone
+        apply(new)
     }
 
     private func startListening() {
@@ -294,14 +424,36 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     /// 자막을 지우는 건 **침묵**뿐이다. 발화가 바뀌었다는 이유로는 지우지 않는다.
     /// DispatchWorkItem 대신 Task 를 쓴다 — 메인 액터 격리를 그대로 물려받고 취소도 같다.
     private func scheduleCaptionClear() {
+        lastCaptionUpdate = Date()
+        scheduleClear(after: settingsStore.value.captionHoldSeconds)
+    }
+
+    private func scheduleClear(after seconds: Double) {
         clearTask?.cancel()
-        let hold = captionHoldSeconds
         clearTask = Task { [weak self] in
-            try? await Task.sleep(for: .seconds(hold))
+            try? await Task.sleep(for: .seconds(seconds))
             guard !Task.isCancelled, let self else { return }
             self.state.clear()
             self.translator.reset() // 유지 시간 만료 — 대기 중이던 번역도 무효화.
             self.clearTask = nil
+            self.lastCaptionUpdate = nil
+        }
+    }
+
+    /// 유지 시간 설정이 바뀌면 마지막 자막 갱신 시각을 기준으로 남은 시간만 다시 기다린다.
+    /// 이미 만료됐어야 하면(예: 10초→3초로 줄였는데 이미 5초 지남) 즉시 지운다.
+    private func rescheduleCaptionClear() {
+        guard let lastCaptionUpdate else { return } // 지울 자막이 없으면 할 일이 없다
+        let elapsed = Date().timeIntervalSince(lastCaptionUpdate)
+        let remaining = settingsStore.value.captionHoldSeconds - elapsed
+        if remaining <= 0 {
+            clearTask?.cancel()
+            clearTask = nil
+            self.lastCaptionUpdate = nil
+            state.clear()
+            translator.reset()
+        } else {
+            scheduleClear(after: remaining)
         }
     }
 
