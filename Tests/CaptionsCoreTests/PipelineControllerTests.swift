@@ -972,3 +972,67 @@ let englishConfig = PipelineConfiguration(source: .microphone, language: .englis
     #expect(event?.sourceLanguage == .korean)
     await harness.waitForEvent { $0.kind == .listening(language: .english) }
 }
+
+// MARK: - D. 목록 UI 연동(CaptionState) — FIX 2 회귀
+//
+// hot swap(위 테스트)은 같은 Run.ledger를 그대로 쓴다 — breakUtterance()는 finalize만
+// 하고 nextID는 이어진다. 그래서 말하는 도중 전환된 문장의 "구제된 final"은 그 문장이
+// 아직 partial이던 동안 받은 것과 **같은 utteranceID**로 돌아온다. AppDelegate 쪽 계약은
+// "그 사이에 CaptionState의 발화 ID 장부(resetLedger)를 비우지 않는다"이다 — 비우면
+// 구제된 final이 자기 줄을 못 찾아 새 UUID로 떨어지고, 옛 줄(미번역)이 위에 남아 같은
+// 문장이 화면에 두 번 보인다. 이 테스트는 장부를 비우지 않았을 때 한 줄로 남는다는
+// 계약 자체를 고정한다 — AppDelegate.apply(_:)는 이 계약을 지키는 쪽(hot swap이면
+// resetLedger 호출 생략)으로 고쳤다.
+@Test @MainActor func 말하는_도중_언어를_바꿔도_한_줄에만_반영된다() async {
+    var behavior = FakeSpeechEngine.Behavior()
+    behavior.plan.finalizesOnLanguageSwitch = true
+    let harness = Harness(engine: FakeSpeechEngine(behavior))
+    let state = CaptionState()
+    let translator = Translator(table: .default, translate: { text, _, _ in "번역:\(text)" })
+    var translated: [UUID: String] = [:]
+    translator.onTranslation = { text, _, id in translated[id] = text }
+
+    @discardableResult
+    func show(_ event: TranscriptEvent) -> Task<Void, Never>? {
+        guard let id = state.apply(event) else { return nil }
+        return translator.submit(event.transcript, from: event.sourceLanguage, captionID: id)
+    }
+
+    harness.controller.requestStart(configuration: koreanConfig)
+    await harness.waitUntilListening()
+    let session = harness.engine.latestSession!
+
+    // 말하는 도중의 partial. 가짜 세션이 hot swap 때 내보내는 구제된 final의 구간(0~1.2)과
+    // 겹치도록 시작 시각을 맞춘다 — 실제로도 전환은 진행 중인 발화 위에서 일어난다.
+    session.emit("전환 직전", isFinal: false, start: 0, end: 0.8)
+    await harness.waitForEvent {
+        if case .transcript(let e) = $0.kind { return e.text == "전환 직전" }
+        return false
+    }
+    show(harness.transcripts[0])
+    #expect(state.entries.count == 1)
+    let originalID = state.entries[0].id
+
+    // 말하는 도중 언어를 바꾼다 — hot swap 조건(소스·민감도 동일, 듣는 중)을 만족해
+    // 같은 실행(Run)이 이어진다.
+    harness.controller.requestReconfigure(configuration: englishConfig)
+    await harness.waitForEvent {
+        if case .transcript(let e) = $0.kind { return e.text == "전환 직전 문장" }
+        return false
+    }
+    #expect(harness.engine.sessions.wrapped.count == 1) // 재시작하지 않았다 — 세션이 하나다
+
+    // 구제된 final. AppDelegate는 이 순간까지 장부를 비우지 않아야 한다(FIX 2) —
+    // 여기서는 그 계약을 직접 지켜서 결과를 고정한다.
+    let rescued = harness.transcripts.first { $0.text == "전환 직전 문장" }!
+    let task = show(rescued)
+    await task?.value
+
+    #expect(state.entries.count == 1)              // 중복 줄이 생기지 않는다
+    #expect(state.entries[0].id == originalID)      // 같은 줄이 갱신됐다 — 새 줄이 아니다
+    #expect(state.entries[0].original == "전환 직전 문장")
+    #expect(state.entries[0].isFinal)
+    #expect(translated[originalID] == "번역:전환 직전 문장") // 번역도 그 줄에 붙는다
+
+    await harness.waitForEvent { $0.kind == .listening(language: .english) }
+}

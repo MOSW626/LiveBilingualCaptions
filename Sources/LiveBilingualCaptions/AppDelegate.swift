@@ -135,12 +135,52 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     /// 설정 창·오버레이 버튼 어느 쪽에서 온 변경이든 지나는 **하나뿐인** 적용 경로.
+    ///
+    /// 마이크가 아닌 다른 소스로의 변경은 곧바로 `performApply`로 간다. **마이크로**
+    /// 바뀌는 변경만 여기서 권한을 먼저 본다(FIX 1) — 거부 상태면 조용히 재구성을
+    /// 밀어붙이지 않고 메시지를 띄운 채 돌아가고, 아직 물어본 적이 없으면 여기서 물어본
+    /// 뒤 승인된 시점에만 실제로 적용한다. 승인 전까지는 `settingsStore`도 화면 라벨도
+    /// 건드리지 않는다 — 그래야 실패해도 "마이크"라고 표시된 채 실제로는 이전 소스가
+    /// 도는 불일치가 생기지 않는다.
+    @discardableResult
+    private func apply(_ new: CaptionsCore.Settings) -> Bool {
+        guard new.audioSource == .microphone, settingsStore.value.audioSource != .microphone else {
+            return performApply(new)
+        }
+        switch AVCaptureDevice.authorizationStatus(for: .audio) {
+        case .authorized:
+            return performApply(new)
+        case .denied, .restricted:
+            state.status = "마이크 권한이 필요합니다"
+            state.canToggle = false
+            return false
+        default: // .notDetermined 및 앞으로 추가될 케이스
+            AVCaptureDevice.requestAccess(for: .audio) { [weak self] granted in
+                Task { @MainActor in
+                    guard let self else { return }
+                    guard granted else {
+                        self.state.status = "마이크 권한이 필요합니다"
+                        self.state.canToggle = false
+                        return
+                    }
+                    self.performApply(new)
+                }
+            }
+            return true // 설정 자체는 유효한 요청이다 — 실제 반영은 권한 확인 뒤.
+        }
+    }
+
     /// 판단(무엇이 바뀌었는지, 재구성이 필요한지)은 `applySettingsChange`(CaptionsCore)가
     /// 순수하게 하고, 여기서는 그 결과를 받아 저장·화면 갱신·후속 작업만 한다.
     @discardableResult
-    private func apply(_ new: CaptionsCore.Settings) -> Bool {
+    private func performApply(_ new: CaptionsCore.Settings) -> Bool {
         let old = settingsStore.value
         guard old != new else { return false }
+
+        // hot swap 판정에 쓸 "전"의 값. 아래에서 currentLanguage·controller 상태가
+        // 둘 다 바뀌므로 손대기 전에 찍어 둔다.
+        let oldLanguage = currentLanguage
+        let wasListening = controller.state == .listening
 
         if new.languageMode != old.languageMode {
             currentLanguage = resolveCurrentLanguage(for: new.languageMode)
@@ -157,8 +197,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
         let result = applySettingsChange(old: old, new: new, running: running,
                                          configuration: currentConfiguration, controller: controller)
+
+        // 말하는 도중의 언어 hot swap(SpeechPipeline.switchLanguage)은 같은 Run과
+        // 그 ledger를 그대로 쓴다 — nextID가 이어진다. 여기서 장부(resetLedger)를 비우면
+        // 그사이 도착하는 "구제된 final"이 방금 지운 장부에서 자기 줄을 못 찾아 새 UUID를
+        // 받고, 옛 줄은 번역도 못 받은 채 화면에 남아 문장이 두 번 보인다(FIX 2).
+        // 오디오 소스·민감도 변경이나, 듣고 있지 않을 때의 언어 변경은 실제로 새 Run으로
+        // 재시작하므로(nextID가 1부터 다시 시작) 그때는 장부를 비워야 옛 ID와 충돌하지 않는다.
+        let isHotLanguageSwap = old.audioSource == new.audioSource
+            && old.detectorSensitivity == new.detectorSensitivity
+            && oldLanguage != currentLanguage
+            && wasListening
         if result.captureChanged || result.pairChanged {
-            invalidateCaptions()
+            invalidateCaptions(resetLedger: !isHotLanguageSwap)
         }
         if result.pairChanged {
             refreshLanguagePairAvailability()
@@ -359,7 +410,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         panel.setFrame(clampedFrame, display: true)
     }
 
+    /// 마이크는 `.microphone` 소스일 때만 필요하다. 시스템 오디오는 화면 기록 권한으로
+    /// 따로 게이트되고(`SystemAudioSource`), 마이크 TCC와는 무관하다 — 저장된 소스가
+    /// 시스템 오디오인 사용자가 마이크를 거부했다고 앱 전체가 영영 멈추면 안 된다(FIX 1).
     private func requestPermissionsAndStart() {
+        guard settingsStore.value.audioSource == .microphone else {
+            startListening()
+            return
+        }
         // 완료 핸들러는 임의 스레드에서 불린다. UI 갱신은 메인 액터로 넘긴다.
         AVCaptureDevice.requestAccess(for: .audio) { [weak self] granted in
             Task { @MainActor in
@@ -384,13 +442,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     /// 진행 중인 번역 작업과 clear 타이머를 취소한다.
-    private func invalidateCaptions() {
+    ///
+    /// `resetLedger`가 false면 발화 ID 장부는 남긴다 — 말하는 도중의 언어 hot swap처럼
+    /// 같은 Run이 이어질 때 쓴다(FIX 2). 장부를 비우면 그사이 도착하는 "구제된 final"이
+    /// 자기 줄을 못 찾아 새 줄로 중복 표시된다.
+    private func invalidateCaptions(resetLedger: Bool = true) {
         clearTask?.cancel()
         clearTask = nil
         lastCaptionUpdate = nil
         translator.reset()
-        // 장부만 비운다. 화면의 자막은 남긴다 — 정지했다고 읽던 줄을 뺏지 않는다.
-        state.resetLedger()
+        if resetLedger {
+            // 장부만 비운다. 화면의 자막은 남긴다 — 정지했다고 읽던 줄을 뺏지 않는다.
+            state.resetLedger()
+        }
     }
 
     @objc private func quitApp() {
