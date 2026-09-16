@@ -20,6 +20,19 @@ public struct CaptionEntry: Identifiable, Sendable, Equatable {
     }
 }
 
+/// `CaptionState.apply`가 돌려주는 줄 하나의 결과. 호출자는 이 `id`와 `transcript`로
+/// `Translator.submit`을 부르면 된다 — 세그멘테이션이 쪼갠 문장마다 자기 번역을 받는다
+/// (스펙 §1, §4).
+public struct CaptionRowUpdate: Sendable, Equatable {
+    public let id: UUID
+    public let transcript: Transcript
+
+    public init(id: UUID, transcript: Transcript) {
+        self.id = id
+        self.transcript = transcript
+    }
+}
+
 /// 자막 화면의 상태 전부.
 ///
 /// 자막은 **한 줄짜리 현재 상태가 아니라 최근 발화의 목록**이다(스펙 §6.6).
@@ -48,7 +61,7 @@ public final class CaptionState {
     public var audioSourceName = AudioSourceKind.microphone.displayName
 
     @ObservationIgnored private var latest = LatestCaption()
-    /// 파이프라인의 (`runID`, `utteranceID`) 쌍 → 그 발화가 받은 줄의 UUID.
+    /// (`runID`, `utteranceID`, `segmentIndex`) 세 쌍 → 그 문장 줄이 받은 UUID.
     ///
     /// 단일 슬롯으로는 안 된다: 옛 구간의 뒤늦은 갱신에 새 UUID를 발급하면 옛 발화가
     /// 목록 맨 아래에 중복으로 끼어들고, 진행 중이던 발화까지 두 줄로 쪼개진다.
@@ -61,51 +74,72 @@ public final class CaptionState {
     /// 다시 시작한다 — 그때 장부가 남아 있으면(resetLedger를 건너뛴 경우) 옛 Run이 남긴
     /// 같은 번호가 새 발화를 옛 줄로 잘못 끌어들인다. `runID`까지 같이 봐야 옛 Run이
     /// 남긴 항목이 새 Run의 번호와 절대 부딪히지 않는다.
-    @ObservationIgnored private var captionIDs: [(runID: Int, utteranceID: Int, captionID: UUID)] = []
+    ///
+    /// `segmentIndex`가 더 있는 이유: 발화 하나(`utteranceID` 하나)가 `CaptionSegmenter`를
+    /// 거치며 문장 여러 개로 쪼개질 수 있다 — 문장마다 자기 줄, 자기 번역이 필요하다
+    /// (스펙 §1, §4). 인덱스는 0부터, 왼쪽에서 오른쪽 문장 순서다. 세그멘터가 상태 없이
+    /// 매번 전체 텍스트를 처음부터 다시 훑으므로 같은 발화의 revision마다 같은 인덱스가
+    /// 같은 문장을 가리킨다 — 그래서 이 인덱스를 장부 키에 그대로 써도 안전하다.
+    @ObservationIgnored private var captionIDs: [(runID: Int, utteranceID: Int, segmentIndex: Int, captionID: UUID)] = []
 
     public init() {}
 
     public var isEmpty: Bool { entries.isEmpty }
 
-    /// 전사 이벤트 하나를 목록에 반영하고, 번역을 걸 발화 ID를 돌려준다.
+    /// 전사 이벤트 하나를 목록에 반영하고, 번역을 걸어야 할 줄들을 돌려준다.
     ///
     /// **이 함수는 어떤 경우에도 목록을 비우지 않는다.** 새 발화는 줄을 추가하고,
     /// 같은 발화의 partial→final 갱신은 제자리를 덮고, 옛 발화의 뒤늦은 갱신은
     /// 자기 줄을 찾아간다. 화면을 비우는 건 침묵과 "지우기"뿐이다(`clear()`).
     ///
-    /// nil은 "반영할 줄이 없다"는 뜻이다 — 이미 밀려난 옛 발화의 갱신이 그렇다.
-    /// 그 경우 번역도 걸지 않는다. 보여줄 데가 없는 번역이라서다.
+    /// 이벤트 하나가 줄 하나라고는 더 이상 보장하지 않는다 — `CaptionSegmenter`가 이
+    /// 이벤트의 누적 텍스트를 문장(또는 안전망이 끊은 조각) 단위로 쪼개고, 여기서는
+    /// 조각마다 자기 UUID를 배정해 문장마다 독립된 번역을 받을 수 있게 한다(스펙 §1,
+    /// §4). 짧고 문장부호 없는 평범한 partial은 조각이 하나뿐이라 예전과 동일하게
+    /// 동작한다. 빈 배열은 "반영할 줄이 없다"는 뜻이다 — 이미 밀려난 옛 발화의 갱신이
+    /// 그렇다. 그 경우 번역도 걸지 않는다. 보여줄 데가 없는 번역이라서다.
     ///
     /// `runID`는 이 이벤트를 만든 파이프라인 실행(Run)의 식별자다(`PipelineEvent.runID`).
     /// `TranscriptEvent` 자체에는 실려 있지 않으므로 호출자가 감싸는 `PipelineEvent`에서
     /// 꺼내 넘긴다. 기본값 0은 실제 파이프라인이 절대 쓰지 않는 값이라(첫 실행 ID는 1)
     /// runID를 신경 쓰지 않는 기존 테스트가 한 실행 안에 있는 것처럼 동작한다.
     @discardableResult
-    public func apply(_ event: TranscriptEvent, runID: Int = 0) -> UUID? {
+    public func apply(_ event: TranscriptEvent, runID: Int = 0) -> [CaptionRowUpdate] {
         let update = latest.apply(event)
-        let id: UUID
-        if update.isOutdated {
-            // 옛 줄이 아직 화면에 있을 때만 갱신한다. 밀려난 발화를 맨 아래에 되살리지 않는다.
-            guard let known = captionIDs.first(where: { $0.runID == runID && $0.utteranceID == event.utteranceID })?.captionID,
-                  entries.contains(where: { $0.id == known })
-            else { return nil }
-            id = known
-        } else {
-            id = captionID(for: event.utteranceID, runID: runID)
+        var results: [CaptionRowUpdate] = []
+        let segments = CaptionSegmenter.segment(update.text, isFinal: event.isFinal)
+        for (index, segment) in segments.enumerated() {
+            let id: UUID
+            if update.isOutdated {
+                // 옛 줄이 아직 화면에 있을 때만 갱신한다. 밀려난 발화를 맨 아래에 되살리지 않는다.
+                guard let known = captionIDs.first(where: {
+                          $0.runID == runID && $0.utteranceID == event.utteranceID && $0.segmentIndex == index
+                      })?.captionID,
+                      entries.contains(where: { $0.id == known })
+                else { continue }
+                id = known
+            } else {
+                id = captionID(for: event.utteranceID, segmentIndex: index, runID: runID)
+            }
+            upsert(id: id, original: segment.text, isFinal: segment.isComplete,
+                   sourceLanguageID: event.sourceLanguage.id)
+            let transcript: Transcript = segment.isComplete ? .final(segment.text) : .partial(segment.text)
+            results.append(CaptionRowUpdate(id: id, transcript: transcript))
         }
-        upsert(id: id, original: CaptionText.tail(update.text),
-               isFinal: event.isFinal, sourceLanguageID: event.sourceLanguage.id)
-        return id
+        return results
     }
 
-    private func captionID(for utteranceID: Int, runID: Int) -> UUID {
-        if let known = captionIDs.first(where: { $0.runID == runID && $0.utteranceID == utteranceID })?.captionID {
+    private func captionID(for utteranceID: Int, segmentIndex: Int, runID: Int) -> UUID {
+        if let known = captionIDs.first(where: {
+            $0.runID == runID && $0.utteranceID == utteranceID && $0.segmentIndex == segmentIndex
+        })?.captionID {
             return known
         }
         let fresh = UUID()
-        captionIDs.append((runID, utteranceID, fresh))
-        // 화면에 남는 줄 + 여유. 늦게 도착하는 갱신을 받아줄 만큼만 기억한다.
-        let bound = max(1, historyCount) + 4
+        captionIDs.append((runID, utteranceID, segmentIndex, fresh))
+        // 화면에 남는 줄 + 여유. 늦게 도착하는 갱신을 받아줄 만큼만 기억한다. 발화 하나가
+        // 여러 문장으로 쪼개질 수 있으므로 예전 한 줄짜리 여유(+4)보다 넉넉히 곱해 둔다.
+        let bound = (max(1, historyCount) + 4) * 4
         if captionIDs.count > bound { captionIDs.removeFirst(captionIDs.count - bound) }
         return fresh
     }

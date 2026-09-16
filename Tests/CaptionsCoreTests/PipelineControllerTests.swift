@@ -867,6 +867,24 @@ let englishConfig = PipelineConfiguration(source: .microphone, language: .englis
     #expect(before.id != after.id)
 }
 
+// 실사용 스크린샷 3장 전부에서 관찰된 버그의 재현: 같은 문장이 번역까지 붙은 줄과
+// 번역 없는 줄, 두 줄로 겹쳐 보였다(아래쪽 — 화면에서 가장 밝은, 즉 가장 최근 줄에
+// 번역이 없었다). 원인은 `assign`이 흔들림을 "최초" 시작 시각 기준으로 재는 것이었다.
+// 문장부호 없이 여러 문장을 한 final로 묶어 내보내는 긴 발화(특히 한국어)는 volatile
+// 조각마다 보고되는 시작 시각이 조금씩(허용치 0.2초 안쪽) 밀릴 수 있는데, 그 조각별
+// 흔들림이 누적되면 최초 값과는 결국 허용치를 넘는다 — final이 자기 발화를 못 찾고
+// 새 발화(새 UUID, 번역 없음)로 떨어져 나간다. 이 테스트는 조각마다 0.15초씩(허용치
+// 0.2초 안쪽) 밀리지만 누적하면 최초 대비 0.3초(허용치 초과)가 되는 시퀀스로 그
+// 상황을 재현한다 — 수정 전에는 마지막 줄에서 새 id가 나와 실패했다.
+@Test func 서서히_흔들리는_시작_시각도_같은_발화로_남는다() {
+    var ledger = UtteranceLedger()
+    let a = ledger.assign(start: 0.0, end: 1.0, isFinal: false)
+    let b = ledger.assign(start: 0.15, end: 2.0, isFinal: false)  // 최초 대비 0.15초 — 허용치 안
+    let c = ledger.assign(start: 0.3, end: 3.0, isFinal: true)    // 최초 대비 0.3초 — 직전 대비로는 0.15초
+    #expect(a.id == b.id)
+    #expect(b.id == c.id) // 누적이 아니라 "직전 조각 대비" 허용치로 비교해야 한다
+}
+
 @Test @MainActor func 전사_이벤트는_실행ID_발화ID_수정번호_언어를_함께_싣는다() async {
     let harness = Harness()
     harness.controller.requestStart(configuration: koreanConfig)
@@ -994,8 +1012,11 @@ let englishConfig = PipelineConfiguration(source: .microphone, language: .englis
 
     @discardableResult
     func show(_ event: TranscriptEvent) -> Task<Void, Never>? {
-        guard let id = state.apply(event) else { return nil }
-        return translator.submit(event.transcript, from: event.sourceLanguage, captionID: id)
+        var last: Task<Void, Never>?
+        for update in state.apply(event) {
+            last = translator.submit(update.transcript, from: event.sourceLanguage, captionID: update.id)
+        }
+        return last
     }
 
     harness.controller.requestStart(configuration: koreanConfig)

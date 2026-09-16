@@ -92,11 +92,20 @@ public enum PipelineError: LocalizedError, Equatable {
 
 /// 오디오 시간 구간으로 발화를 구분한다.
 ///
-/// 규칙은 **시작 시각**이다. volatile 갱신은 같은 발화의 시작 시각을 유지하며 끝만
-/// 늘리고, 다음 발화는 이전 발화가 끝난 자리에서 새 시작 시각으로 온다. 그래서
+/// 규칙은 **시작 시각**이다. volatile 갱신은 같은 발화의 시작 시각 근처를 유지하며
+/// 끝만 늘리고, 다음 발화는 이전 발화가 끝난 자리에서 새 시작 시각으로 온다. 그래서
 /// 시작 시각이 (오차 범위 안에서) 같고 아직 확정되지 않은 발화에만 갱신을 붙인다.
 /// 문자열을 보지 않으므로 같은 문장을 두 번 말해도 두 발화로 남고, 확정된 구간의
 /// final이 뒤늦게 도착해도 그 사이에 시작된 새 발화를 덮어쓰지 않는다.
+///
+/// 비교 기준은 **최초** 시작 시각이 아니라 **직전에 맞춰본** 시작 시각이다(아래
+/// `assign`이 매번 갱신한다). 긴 발화(특히 문장부호 없이 여러 문장을 묶어 내보내는
+/// 한국어 final)는 volatile 조각마다 보고되는 시작 시각이 조금씩 밀릴 수 있는데,
+/// 그 흔들림을 최초 값에 고정해 비교하면 한 조각씩은 허용치 안이어도 누적으로는
+/// 허용치를 넘어버린다 — final이 자기 발화를 못 찾고 새 발화로 떨어져 나가, 사용자
+/// 눈에는 같은 문장이 번역 없는 줄로 화면에 중복 표시된다(실사용 스크린샷에서 관찰된
+/// 버그의 원인). 직전 값과 비교하면 조각 사이의 흔들림만 허용치 안이면 되므로 이
+/// 누적 드리프트를 흡수한다.
 public struct UtteranceLedger: Sendable {
     public struct Assignment: Sendable, Equatable {
         public let id: Int
@@ -121,6 +130,7 @@ public struct UtteranceLedger: Sendable {
     public mutating func assign(start: Double, end: Double, isFinal: Bool) -> Assignment {
         if let index = entries.lastIndex(where: { !$0.finalized && abs($0.start - start) <= tolerance }) {
             entries[index].revision += 1
+            entries[index].start = start // 직전 대비로만 흔들림을 잰다 — 흔들림이 쌓이지 않게.
             entries[index].end = max(entries[index].end, end)
             entries[index].finalized = entries[index].finalized || isFinal
             return Assignment(id: entries[index].id, revision: entries[index].revision)

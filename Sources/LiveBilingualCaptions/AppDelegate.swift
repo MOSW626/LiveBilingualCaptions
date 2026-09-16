@@ -272,14 +272,22 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     private func show(_ event: TranscriptEvent, runID: Int) {
-        // 목록 규칙(추가 vs 갱신, 옛 줄 찾아가기, 트리밍)은 전부 CaptionState 에 있다.
-        // 여기는 글루다 — 화면을 비우는 판단이 이 경로에 끼어들 자리가 없다.
-        // nil 은 이미 밀려난 옛 발화의 갱신이라는 뜻이고, 그러면 번역도 걸지 않는다.
-        // runID를 같이 넘긴다 — CaptionState의 장부는 (runID, utteranceID) 쌍으로 키가
-        // 잡혀 있어서, 언어 hot swap이 런타임에 실패해 새 Run이 조용히 열려도(그래서
-        // utteranceID가 1부터 되풀이돼도) 옛 Run의 매핑과 절대 부딪히지 않는다.
-        guard let captionID = state.apply(event, runID: runID) else { return }
-        translator.submit(event.transcript, from: event.sourceLanguage, captionID: captionID)
+        // 목록 규칙(추가 vs 갱신, 옛 줄 찾아가기, 트리밍, 문장 쪼개기)은 전부
+        // CaptionState 에 있다. 여기는 글루다 — 화면을 비우는 판단이 이 경로에 끼어들
+        // 자리가 없다. 빈 배열은 이미 밀려난 옛 발화의 갱신이라는 뜻이고, 그러면
+        // 번역도 걸지 않는다. runID를 같이 넘긴다 — CaptionState의 장부는 (runID,
+        // utteranceID, segmentIndex) 세 쌍으로 키가 잡혀 있어서, 언어 hot swap이
+        // 런타임에 실패해 새 Run이 조용히 열려도(그래서 utteranceID가 1부터
+        // 되풀이돼도) 옛 Run의 매핑과 절대 부딪히지 않는다.
+        //
+        // 이벤트 하나가 문장 여러 개로 쪼개질 수 있다 — 조각마다 자기 UUID와 자기
+        // transcript로 따로 번역을 건다(스펙 §1). 원문 전체가 아니라 조각의 텍스트만
+        // 넘기므로 번역도 문장 단위로 붙는다.
+        let updates = state.apply(event, runID: runID)
+        guard !updates.isEmpty else { return }
+        for update in updates {
+            translator.submit(update.transcript, from: event.sourceLanguage, captionID: update.id)
+        }
         // 말이 이어지는 동안에는 지우기 타이머를 계속 뒤로 민다.
         scheduleCaptionClear()
 
