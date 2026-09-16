@@ -204,6 +204,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         // 받고, 옛 줄은 번역도 못 받은 채 화면에 남아 문장이 두 번 보인다(FIX 2).
         // 오디오 소스·민감도 변경이나, 듣고 있지 않을 때의 언어 변경은 실제로 새 Run으로
         // 재시작하므로(nextID가 1부터 다시 시작) 그때는 장부를 비워야 옛 ID와 충돌하지 않는다.
+        //
+        // 이 판정은 설정값만 보고 동기적으로 내린다 — SpeechPipeline.switchLanguage가
+        // 런타임에 실패할 수 있다는 걸(지원하지 않는 locale, 호환 안 되는 오디오 포맷)
+        // 미리 알 방법이 없다. 실패하면 PipelineController.drain()이 조용히 stop 후
+        // 새 Run으로 재시작하고, 그 Run의 utteranceID는 1부터 다시 시작한다 — 이 판정이
+        // "hot swap"이라고 잘못 믿고 장부를 살려 둔 채로. 하지만 그래도 안전하다:
+        // CaptionState.captionIDs는 이제 utteranceID 단독이 아니라 (runID, utteranceID)
+        // 쌍으로 키가 잡혀 있어서, 옛 Run이 남긴 항목이 새 Run의 같은 번호와 부딪히지
+        // 않는다. 즉 이 판정의 정확성이 더 이상 정답성의 전제조건이 아니다 — 맞으면
+        // 불필요한 리셋을 피하고 중복 줄(FIX 2)을 막아 줄 뿐이다. 그렇다고 "이제 필요
+        // 없다"며 run 스코프를 걷어내지 말 것 — 이 판정이 여전히 진짜로 하는 일이다.
         let isHotLanguageSwap = old.audioSource == new.audioSource
             && old.detectorSensitivity == new.detectorSensitivity
             && oldLanguage != currentLanguage
@@ -254,17 +265,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             currentLanguage = language
             updateListeningStatus()
         case .transcript(let transcript):
-            show(transcript)
+            show(transcript, runID: event.runID)
         case .failed:
             break // 상태 콜백이 메시지를 이미 보여준다
         }
     }
 
-    private func show(_ event: TranscriptEvent) {
+    private func show(_ event: TranscriptEvent, runID: Int) {
         // 목록 규칙(추가 vs 갱신, 옛 줄 찾아가기, 트리밍)은 전부 CaptionState 에 있다.
         // 여기는 글루다 — 화면을 비우는 판단이 이 경로에 끼어들 자리가 없다.
         // nil 은 이미 밀려난 옛 발화의 갱신이라는 뜻이고, 그러면 번역도 걸지 않는다.
-        guard let captionID = state.apply(event) else { return }
+        // runID를 같이 넘긴다 — CaptionState의 장부는 (runID, utteranceID) 쌍으로 키가
+        // 잡혀 있어서, 언어 hot swap이 런타임에 실패해 새 Run이 조용히 열려도(그래서
+        // utteranceID가 1부터 되풀이돼도) 옛 Run의 매핑과 절대 부딪히지 않는다.
+        guard let captionID = state.apply(event, runID: runID) else { return }
         translator.submit(event.transcript, from: event.sourceLanguage, captionID: captionID)
         // 말이 이어지는 동안에는 지우기 타이머를 계속 뒤로 민다.
         scheduleCaptionClear()

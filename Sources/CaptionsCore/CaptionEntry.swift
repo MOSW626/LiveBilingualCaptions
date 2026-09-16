@@ -48,13 +48,20 @@ public final class CaptionState {
     public var audioSourceName = AudioSourceKind.microphone.displayName
 
     @ObservationIgnored private var latest = LatestCaption()
-    /// 파이프라인의 Int `utteranceID` → 그 발화가 받은 줄의 UUID.
+    /// 파이프라인의 (`runID`, `utteranceID`) 쌍 → 그 발화가 받은 줄의 UUID.
     ///
     /// 단일 슬롯으로는 안 된다: 옛 구간의 뒤늦은 갱신에 새 UUID를 발급하면 옛 발화가
     /// 목록 맨 아래에 중복으로 끼어들고, 진행 중이던 발화까지 두 줄로 쪼개진다.
     /// 삽입 순서 배열 하나로 조회와 퇴출을 같이 한다 — 원소는 화면 줄 수 + 여유가 상한이라
     /// 선형 탐색으로 충분하다.
-    @ObservationIgnored private var captionIDs: [(utteranceID: Int, captionID: UUID)] = []
+    ///
+    /// 키가 `utteranceID` 단독이 아니라 `runID`와의 쌍인 이유: `utteranceID`는 파이프라인
+    /// 실행(Run) 하나 안에서만 유일하다. 언어 hot swap이 실패해 조용히 새 Run으로
+    /// 재시작되면(AppDelegate는 이를 미리 알 수 없다) 새 Run의 `utteranceID`도 1부터
+    /// 다시 시작한다 — 그때 장부가 남아 있으면(resetLedger를 건너뛴 경우) 옛 Run이 남긴
+    /// 같은 번호가 새 발화를 옛 줄로 잘못 끌어들인다. `runID`까지 같이 봐야 옛 Run이
+    /// 남긴 항목이 새 Run의 번호와 절대 부딪히지 않는다.
+    @ObservationIgnored private var captionIDs: [(runID: Int, utteranceID: Int, captionID: UUID)] = []
 
     public init() {}
 
@@ -68,30 +75,35 @@ public final class CaptionState {
     ///
     /// nil은 "반영할 줄이 없다"는 뜻이다 — 이미 밀려난 옛 발화의 갱신이 그렇다.
     /// 그 경우 번역도 걸지 않는다. 보여줄 데가 없는 번역이라서다.
+    ///
+    /// `runID`는 이 이벤트를 만든 파이프라인 실행(Run)의 식별자다(`PipelineEvent.runID`).
+    /// `TranscriptEvent` 자체에는 실려 있지 않으므로 호출자가 감싸는 `PipelineEvent`에서
+    /// 꺼내 넘긴다. 기본값 0은 실제 파이프라인이 절대 쓰지 않는 값이라(첫 실행 ID는 1)
+    /// runID를 신경 쓰지 않는 기존 테스트가 한 실행 안에 있는 것처럼 동작한다.
     @discardableResult
-    public func apply(_ event: TranscriptEvent) -> UUID? {
+    public func apply(_ event: TranscriptEvent, runID: Int = 0) -> UUID? {
         let update = latest.apply(event)
         let id: UUID
         if update.isOutdated {
             // 옛 줄이 아직 화면에 있을 때만 갱신한다. 밀려난 발화를 맨 아래에 되살리지 않는다.
-            guard let known = captionIDs.first(where: { $0.utteranceID == event.utteranceID })?.captionID,
+            guard let known = captionIDs.first(where: { $0.runID == runID && $0.utteranceID == event.utteranceID })?.captionID,
                   entries.contains(where: { $0.id == known })
             else { return nil }
             id = known
         } else {
-            id = captionID(for: event.utteranceID)
+            id = captionID(for: event.utteranceID, runID: runID)
         }
         upsert(id: id, original: CaptionText.tail(update.text),
                isFinal: event.isFinal, sourceLanguageID: event.sourceLanguage.id)
         return id
     }
 
-    private func captionID(for utteranceID: Int) -> UUID {
-        if let known = captionIDs.first(where: { $0.utteranceID == utteranceID })?.captionID {
+    private func captionID(for utteranceID: Int, runID: Int) -> UUID {
+        if let known = captionIDs.first(where: { $0.runID == runID && $0.utteranceID == utteranceID })?.captionID {
             return known
         }
         let fresh = UUID()
-        captionIDs.append((utteranceID, fresh))
+        captionIDs.append((runID, utteranceID, fresh))
         // 화면에 남는 줄 + 여유. 늦게 도착하는 갱신을 받아줄 만큼만 기억한다.
         let bound = max(1, historyCount) + 4
         if captionIDs.count > bound { captionIDs.removeFirst(captionIDs.count - bound) }

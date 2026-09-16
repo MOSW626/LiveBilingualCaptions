@@ -206,3 +206,35 @@ private func event(_ utteranceID: Int, _ text: String, isFinal: Bool = true,
     #expect(state.apply(event(0, "태초의 발화", revision: 1)) == nil)
     #expect(state.entries.map(\.original) == ["발화 198", "발화 199"])
 }
+
+// MARK: - runID 스코핑 — 언어 hot swap이 런타임에 실패해 새 Run이 조용히 열리는 경우의 회귀 테스트
+//
+// AppDelegate는 설정값만 보고 "hot swap"을 판정하므로, SpeechPipeline.switchLanguage가
+// 런타임에 실패해(지원 안 되는 locale, 호환 안 되는 오디오 포맷) PipelineController가
+// 조용히 stop 후 새 Run으로 재시작해도 미리 알 수 없다. 새 Run의 utteranceID는 1부터
+// 다시 시작하므로, 장부가 utteranceID만 본다면 새 Run의 첫 발화가 옛 Run이 남긴 같은
+// 번호의 줄을 덮어써 버린다(내용이 다른 발화가 같은 줄로 섞이는 조용한 오염).
+// (runID, utteranceID) 쌍으로 키를 잡으면 이 충돌이 원천적으로 불가능해진다.
+
+@Test @MainActor func 다른_Run의_같은_발화_ID는_다른_줄이_된다() {
+    let state = CaptionState()
+    let runA = state.apply(event(1, "런 A의 발화"), runID: 1)
+    let runB = state.apply(event(1, "런 B의 발화"), runID: 2) // 같은 utteranceID, 다른 Run
+
+    #expect(runA != nil)
+    #expect(runB != nil)
+    #expect(runA != runB)             // 별개의 줄이어야 한다 — 런 A의 줄을 훔치지 않는다
+    #expect(state.entries.count == 2) // 런 A의 줄을 덮어쓰지 않는다
+    #expect(state.entries[0].original == "런 A의 발화")
+    #expect(state.entries[1].original == "런 B의 발화")
+}
+
+@Test @MainActor func 같은_Run_안에서는_같은_발화_ID가_한_줄을_갱신한다() {
+    let state = CaptionState()
+    let first = state.apply(event(1, "안녕", isFinal: false), runID: 5)
+    let second = state.apply(event(1, "안녕하세요", revision: 1), runID: 5)
+    #expect(first == second) // 같은 Run + 같은 발화 = 같은 줄 = 같은 번역 대상
+    #expect(state.entries.count == 1)
+    #expect(state.entries[0].original == "안녕하세요")
+    #expect(state.entries[0].isFinal)
+}
