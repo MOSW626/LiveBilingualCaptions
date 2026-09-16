@@ -216,6 +216,10 @@ final class FakeSpeechSession: SpeechSession, @unchecked Sendable {
         var languageSwaps: [Locale] = []
         var continuation: AsyncThrowingStream<TranscriptionChunk, any Error>.Continuation?
         var inputError: (any Error)?
+        /// `emit(_:)`이 다음 조각에 찍을 값. `start`가 초기값을 심고, `setLanguage`가
+        /// 실제 세션처럼 교체 커밋 지점(runID)과 확정 지점(language)에서 갈아끼운다.
+        var currentRunID = 0
+        var currentLanguage: CaptionLanguage = .korean
     }
 
     let locale: Locale
@@ -277,12 +281,14 @@ final class FakeSpeechSession: SpeechSession, @unchecked Sendable {
         return plan.plainNegotiationFails ? nil : analysisFormat
     }
 
-    func start(format: AVAudioFormat, input: AudioInputQueue) async throws -> AsyncThrowingStream<TranscriptionChunk, any Error> {
+    func start(format: AVAudioFormat, input: AudioInputQueue, runID: Int, language: CaptionLanguage) async throws -> AsyncThrowingStream<TranscriptionChunk, any Error> {
         if plan.startFails { throw TestError.startFailed }
         let (stream, continuation) = AsyncThrowingStream<TranscriptionChunk, any Error>.makeStream()
         state.mutate {
             $0.preparedFormat = format
             $0.continuation = continuation
+            $0.currentRunID = runID
+            $0.currentLanguage = language
         }
         if plan.drainsInput {
             let waitsForGate = plan.drainWaitsForGate
@@ -307,13 +313,17 @@ final class FakeSpeechSession: SpeechSession, @unchecked Sendable {
         return stream
     }
 
-    func setLanguage(_ locale: Locale) async throws -> Bool {
+    func setLanguage(_ locale: Locale, runID: Int, language: CaptionLanguage) async throws -> Bool {
         state.mutate { $0.languageSwaps.append(locale) }
         guard plan.setLanguageSucceeds else { return false }
+        // 실제 세션과 같은 순서: 커밋 지점에서 runID부터 올린다 — 구제된 final도 새
+        // runID를 달고 나가야 controller 필터를 통과한다. language는 아직 옛 값이다.
+        state.mutate { $0.currentRunID = runID }
         // 실제 세션은 교체 전에 finalize 해서 진행 중이던 발화를 확정해 내보낸다.
         if plan.finalizesOnLanguageSwitch {
             emit("전환 직전 문장", isFinal: true, start: 0, end: 1.2)
         }
+        state.mutate { $0.currentLanguage = language }
         return true
     }
 
@@ -327,10 +337,13 @@ final class FakeSpeechSession: SpeechSession, @unchecked Sendable {
         await finished.fire()
     }
 
-    /// 분석기가 결과를 내보내는 것을 흉내낸다.
+    /// 분석기가 결과를 내보내는 것을 흉내낸다. runID·language는 지금 세션이 찍고 있는
+    /// "생산 시점" 값을 그대로 쓴다(실제 세션의 pump와 같은 계약).
     func emit(_ text: String, isFinal: Bool, start: Double, end: Double) {
-        state.wrapped.continuation?.yield(
-            TranscriptionChunk(text: text, isFinal: isFinal, start: start, end: end))
+        let snapshot = state.wrapped
+        snapshot.continuation?.yield(
+            TranscriptionChunk(text: text, isFinal: isFinal, start: start, end: end,
+                                runID: snapshot.currentRunID, language: snapshot.currentLanguage))
     }
 
     func emitFailure(_ error: any Error) {
@@ -989,6 +1002,80 @@ let englishConfig = PipelineConfiguration(source: .microphone, language: .englis
     // 확정된 문장은 전환 전 언어로 남는다.
     #expect(event?.sourceLanguage == .korean)
     await harness.waitForEvent { $0.kind == .listening(language: .english) }
+}
+
+// MARK: - C-1. 실행 정체성은 생산 시점에 찍는다 (2026-09-17 야간 보완 #1)
+
+@Test @MainActor func 성공한_전환의_구제된_final은_옛_언어를_첫_조각은_새_언어를_싣는다() async {
+    // 언어 전환 도중에는 같은 실행 안에서 구제된 final(옛 언어)과 새 pump의 첫 조각
+    // (새 언어)이 같은 스트림으로 섞여 나온다. run.language를 emit 시점에 live로
+    // 읽으면 이 둘을 구별하지 못한다 — 조각 자신이 생산 시점에 찍은 값만 믿어야 한다.
+    var behavior = FakeSpeechEngine.Behavior()
+    behavior.plan.finalizesOnLanguageSwitch = true
+    let harness = Harness(engine: FakeSpeechEngine(behavior))
+    harness.controller.requestStart(configuration: koreanConfig)
+    await harness.waitUntilListening()
+    let session = harness.engine.latestSession!
+
+    harness.controller.requestReconfigure(configuration: englishConfig)
+    await harness.waitForEvent {
+        if case .transcript(let e) = $0.kind { return e.text == "전환 직전 문장" }
+        return false
+    }
+    await harness.waitForEvent { $0.kind == .listening(language: .english) }
+
+    session.emit("전환 뒤 첫 조각", isFinal: false, start: 2, end: 2.5)
+    await harness.waitForEvent {
+        if case .transcript(let e) = $0.kind { return e.text == "전환 뒤 첫 조각" }
+        return false
+    }
+
+    let rescued = harness.transcripts.first { $0.text == "전환 직전 문장" }!
+    let afterSwitch = harness.transcripts.first { $0.text == "전환 뒤 첫 조각" }!
+    #expect(rescued.sourceLanguage == .korean)     // 구제된 final은 여전히 옛 언어
+    #expect(afterSwitch.sourceLanguage == .english) // 새 pump의 첫 조각은 새 언어
+}
+
+@Test @MainActor func 실패한_언어_전환의_유령_청크는_재시작한_새_Run과_runID가_겹치지_않는다() async {
+    // controller를 거치지 않고 SpeechPipeline을 바로 몬다 — controller 자체의
+    // runID==generation 필터가 결함이 있는 값도 우연히 걸러버려 버그를 가릴 수 있어서,
+    // 결함이 있는 그 값 자체(PipelineEvent.runID)를 직접 살펴야 한다.
+    var behavior = FakeSpeechEngine.Behavior()
+    behavior.plan.setLanguageSucceeds = false
+    let engine = FakeSpeechEngine(behavior)
+    let pipeline = SpeechPipeline(engine: engine, makeSource: { _ in FakeAudioSource() })
+    var events: [PipelineEvent] = []
+    let signal = Signal()
+    pipeline.onEvent = { event in
+        events.append(event)
+        signal.fire()
+    }
+
+    await pipeline.start(koreanConfig, generation: 1)
+    while !events.contains(where: { $0.kind == .listening(language: .korean) }) { await signal.wait() }
+    let oldSession = engine.latestSession!
+
+    // 세션 수준에서 실패할 교체를 시도하기 전, 옛 pump가 이미 만들어 내보낸 조각 —
+    // 전환과 무관하게 큐에 있던, 뒤늦게 도착하는 결과를 흉내낸다.
+    oldSession.emit("유령 청크", isFinal: false, start: 0, end: 0.5)
+    while !events.contains(where: { if case .transcript(let e) = $0.kind { return e.text == "유령 청크" }; return false }) {
+        await signal.wait()
+    }
+    let ghost = events.first { if case .transcript(let e) = $0.kind { return e.text == "유령 청크" }; return false }!
+
+    let swapped = await pipeline.switchLanguage(to: .english, generation: 2)
+    #expect(swapped == false)
+
+    // PipelineController.drain()과 같은 순서: 실패하면 정지 후 같은 generation으로
+    // 재시작한다(generation은 실패한 시도에서도 이미 올라 있었다).
+    await pipeline.stop()
+    await pipeline.start(englishConfig, generation: 2)
+    while !events.contains(where: { $0.kind == .listening(language: .english) }) { await signal.wait() }
+    let newListening = events.last { $0.kind == .listening(language: .english) }!
+
+    #expect(ghost.runID == 1)          // 유령 청크는 옛 run의 id를 그대로 유지한다
+    #expect(newListening.runID == 2)   // 재시작한 새 Run은 새 generation을 쓴다
+    #expect(ghost.runID != newListening.runID) // 겹치지 않는다 — 핵심 단정
 }
 
 // MARK: - D. 목록 UI 연동(CaptionState) — FIX 2 회귀

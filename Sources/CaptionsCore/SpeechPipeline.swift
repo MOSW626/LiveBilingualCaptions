@@ -383,18 +383,27 @@ public final class AudioSinkGate: @unchecked Sendable {
 // MARK: - Speech 프레임워크 경계
 
 /// 전사 결과 한 조각. Speech 프레임워크 타입이 이 선을 넘어오지 않는다.
+///
+/// `runID`·`language`는 세션이 이 조각을 만드는 **바로 그 순간**에 찍는다 — 나중에
+/// `SpeechPipeline`이 실행 상태를 보고 다시 매기지 않는다. hot swap 도중에는 같은
+/// 실행 안에서 옛 언어의 구제된 final과 새 언어의 첫 조각이 같은 스트림으로 섞여
+/// 나오므로, 조각 자신이 자기 출처를 증언해야 나중에 값이 바뀌어도 흔들리지 않는다.
 public struct TranscriptionChunk: Sendable, Equatable {
     public let text: String
     public let isFinal: Bool
     /// 오디오 시간 기준 구간(초).
     public let start: Double
     public let end: Double
+    public let runID: Int
+    public let language: CaptionLanguage
 
-    public init(text: String, isFinal: Bool, start: Double, end: Double) {
+    public init(text: String, isFinal: Bool, start: Double, end: Double, runID: Int, language: CaptionLanguage) {
         self.text = text
         self.isFinal = isFinal
         self.start = start
         self.end = end
+        self.runID = runID
+        self.language = language
     }
 }
 
@@ -405,13 +414,17 @@ public protocol SpeechSession: Sendable {
     func installAssets(progress: @escaping @Sendable (Double) -> Void) async throws
     /// 분석 포맷 협상. `considering`을 주면 캡처 포맷에 가까운 결과를 노린다.
     func bestAudioFormat(considering natural: AVAudioFormat?) async -> AVAudioFormat?
-    /// 협상된 포맷으로 분석을 시작하고 결과 스트림을 돌려준다.
-    func start(format: AVAudioFormat, input: AudioInputQueue) async throws -> AsyncThrowingStream<TranscriptionChunk, any Error>
+    /// 협상된 포맷으로 분석을 시작하고 결과 스트림을 돌려준다. `runID`·`language`는
+    /// 이 실행이 내보내는 조각에 찍을 초기 식별값이다.
+    func start(format: AVAudioFormat, input: AudioInputQueue, runID: Int, language: CaptionLanguage) async throws -> AsyncThrowingStream<TranscriptionChunk, any Error>
     /// 포맷이 호환되면 모듈만 갈아끼우고 true. 아니면 false — 호출자가 재시작한다.
     ///
     /// 교체 **전에** 진행 중인 오디오를 확정하고 그 결과를 결과 스트림으로 내보내야
-    /// 한다. 그냥 갈아끼우면 사용자가 말하던 문장이 final 없이 사라진다.
-    func setLanguage(_ locale: Locale) async throws -> Bool
+    /// 한다. 그냥 갈아끼우면 사용자가 말하던 문장이 final 없이 사라진다. 확정된
+    /// 문장(구제된 final)은 `runID`(호출자가 이미 최신 generation으로 올려 건넨 값)를
+    /// 달고 나가되, `language`는 교체가 실제로 끝나기 전까지 옛 값으로 남는다 —
+    /// 그 문장은 옛 언어로 말해진 것이기 때문이다. 실패하면 아무것도 바꾸지 않는다.
+    func setLanguage(_ locale: Locale, runID: Int, language: CaptionLanguage) async throws -> Bool
     func finish() async
 }
 
@@ -497,17 +510,20 @@ public final class SpeechPipeline {
         guard let locale = await engine.supportedLocale(equivalentTo: language.locale) else { return false }
         guard current === run else { return false }
 
-        // 교체를 시작하기 전에 실행 ID를 최신 generation으로 올린다. 세션이 교체 직전에
-        // 확정해 내보내는 마지막 문장이 controller의 generation 필터에 걸려 사라지지
-        // 않도록 — 그 문장이야말로 사용자가 방금 말한, 잃으면 안 되는 문장이다.
-        // 언어는 교체가 성공한 **뒤에** 바꾼다. 그 마지막 문장은 아직 이전 언어다.
-        run.id = generation
-        guard let swapped = try? await session.setLanguage(locale), swapped else { return false }
+        // 실행 ID는 세션에 넘겨서 세션이 직접 조각에 찍게 한다(생산 시점 스탬프) —
+        // 교체 직전에 확정해 내보내는 마지막 문장도 이 값을 달고 나가 controller의
+        // generation 필터에 걸려 사라지지 않는다. 그 문장이야말로 사용자가 방금 말한,
+        // 잃으면 안 되는 문장이다. 이 Run 객체의 `id`/`language` 필드는 교체가
+        // **확정 성공한 뒤에만** 갱신한다 — 실패하면 세션은 아무것도 찍지 않았으므로
+        // 옛 조각은 여전히 옛 run.id를 달고 나가고, 재시작한 새 Run과 값이 겹치지 않는다.
+        guard let swapped = try? await session.setLanguage(locale, runID: generation, language: language),
+              swapped else { return false }
         guard current === run else { return false }
 
         await reserveIfNeeded(locale, run: run)
         guard current === run else { return false }
 
+        run.id = generation
         run.configuration.language = language
         run.language = language
         run.ledger.breakUtterance()
@@ -554,7 +570,7 @@ public final class SpeechPipeline {
         run.queue = queue
         gate.attach(queue)
 
-        let results = try await session.start(format: analysisFormat, input: queue)
+        let results = try await session.start(format: analysisFormat, input: queue, runID: run.id, language: run.language)
         try checkAlive(run)
 
         run.resultsTask = Task { [weak self] in
@@ -606,11 +622,15 @@ public final class SpeechPipeline {
                 if LatencyTiming.enabled {
                     logTiming(run: run, chunk: chunk, assignment: assignment, firstPartialAt: &firstPartialAt)
                 }
+                // runID·언어는 조각에 이미 찍혀 있는 값만 쓴다(생산 시점 스탬프) — 여기서
+                // run.id/run.language를 다시 읽지 않는다. hot swap 도중에는 그 필드들이
+                // 이미 다음 상태로 넘어가 있을 수 있어, 그 순간 흘러오는 옛 조각에 새
+                // 값을 잘못 입히게 된다.
                 let transcript: Transcript = chunk.isFinal ? .final(chunk.text) : .partial(chunk.text)
-                emit(run.id, .transcript(TranscriptEvent(
+                emit(chunk.runID, .transcript(TranscriptEvent(
                     utteranceID: assignment.id,
                     revision: assignment.revision,
-                    sourceLanguage: run.language,
+                    sourceLanguage: chunk.language,
                     transcript: transcript)))
             }
         } catch {
@@ -742,6 +762,11 @@ actor SystemSpeechSession: SpeechSession {
     /// 언어 교체 직전까지 돌던 pump. 확정된 마지막 결과를 마저 실어 나른다.
     private var retiredPump: Task<Void, Never>?
     private var continuation: AsyncThrowingStream<TranscriptionChunk, any Error>.Continuation?
+    /// 지금 나가는 조각에 찍을 실행 ID. `setLanguage`가 교체를 커밋하기 **직전**(finalize
+    /// 호출 전)에 올려서, 그 finalize가 실어 내보내는 구제된 final도 이 값을 달고 나간다.
+    /// pump는 이 값을 매 yield마다 살아있는 그대로 읽는다 — 언어(per-pump 고정)와 달리
+    /// runID는 같은 pump가 살아있는 동안에도 바뀔 수 있어야 하기 때문이다.
+    private var currentRunID: Int = 0
 
     init(locale: Locale, sensitivity: DetectorSensitivity) {
         self.locale = locale
@@ -786,16 +811,17 @@ actor SystemSpeechSession: SpeechSession {
         return await SpeechAnalyzer.bestAvailableAudioFormat(compatibleWith: modules)
     }
 
-    func start(format: AVAudioFormat, input: AudioInputQueue) async throws -> AsyncThrowingStream<TranscriptionChunk, any Error> {
+    func start(format: AVAudioFormat, input: AudioInputQueue, runID: Int, language: CaptionLanguage) async throws -> AsyncThrowingStream<TranscriptionChunk, any Error> {
         let analyzer = SpeechAnalyzer(modules: modules)
         // 협상된 포맷을 넘긴다. 분석기는 자동 리샘플링하지 않는다.
         try await analyzer.prepareToAnalyze(in: format)
         self.analyzer = analyzer
         self.analysisFormat = format
+        self.currentRunID = runID
 
         let (stream, continuation) = AsyncThrowingStream<TranscriptionChunk, any Error>.makeStream()
         self.continuation = continuation
-        startPump()
+        startPump(language: language)
 
         analysisTask = Task { [weak self] in
             do { _ = try await analyzer.analyzeSequence(AnalyzerInputs(queue: input)) }
@@ -804,7 +830,7 @@ actor SystemSpeechSession: SpeechSession {
         return stream
     }
 
-    func setLanguage(_ newLocale: Locale) async throws -> Bool {
+    func setLanguage(_ newLocale: Locale, runID: Int, language: CaptionLanguage) async throws -> Bool {
         guard let analyzer, let analysisFormat else { return false }
         let candidate = Self.makeTranscriber(newLocale)
         let newModules: [any SpeechModule] = [detector, candidate]
@@ -815,6 +841,14 @@ actor SystemSpeechSession: SpeechSession {
               format.commonFormat == analysisFormat.commonFormat,
               format.isInterleaved == analysisFormat.isInterleaved
         else { return false }
+        // 여기까지는 아무것도 바꾸지 않았다 — 호환되지 않으면 옛 pump는 계속 옛
+        // runID·언어를 찍은 채로 산다. 실패한 교체 뒤 호출자가 새 Run으로 재시작해도
+        // 그 새 Run의 id와 겹치지 않는다.
+
+        // 커밋 지점: finalize가 실어 내보낼 구제된 final부터 새 runID를 달고 나가야
+        // controller의 generation 필터를 통과한다. 언어는 아직 올리지 않는다 —
+        // 그 문장은 옛 언어로 말해진 것이다.
+        currentRunID = runID
 
         // 1) 이미 먹인 오디오를 먼저 확정한다. 이걸 건너뛰고 모듈만 갈아끼우면 사용자가
         //    방금 말하던 문장이 final 없이 사라진다 — 자막이 말 없이 증발하는 것은 이
@@ -833,7 +867,7 @@ actor SystemSpeechSession: SpeechSession {
         retiredPump = pumpTask
         transcriber = candidate
         locale = newLocale
-        startPump()
+        startPump(language: language)
         return true
     }
 
@@ -847,19 +881,28 @@ actor SystemSpeechSession: SpeechSession {
     }
 
     /// 결과 스트림은 실행 내내 하나다. 언어를 바꿔도 소비자가 다시 구독하지 않는다.
-    private func startPump() {
+    ///
+    /// `language`는 이 pump 인스턴스 수명 내내 고정된다(이 pump가 물린 transcriber가
+    /// 그 언어로 인식하는 동안만 산다) — 나중에 `setLanguage`가 언어를 올려도 이미
+    /// 돌고 있는(은퇴 예정인) pump는 옛 언어를 계속 찍는다. `runID`는 반대로 매
+    /// yield마다 `currentRunID`를 살아있는 그대로 읽는다 — `setLanguage`가 finalize
+    /// 직전에 미리 올려두면, 같은 pump가 실어 나르는 구제된 final도 새 runID를 단다.
+    private func startPump(language: CaptionLanguage) {
         let results = transcriber.results
         let sink = continuation
-        pumpTask = Task {
+        pumpTask = Task { [weak self] in
             do {
                 for try await result in results {
                     let text = String(result.text.characters).trimmingCharacters(in: .whitespacesAndNewlines)
                     guard !text.isEmpty else { continue }
+                    guard let runID = await self?.currentRunID else { return }
                     sink?.yield(TranscriptionChunk(
                         text: text,
                         isFinal: result.isFinal,
                         start: result.range.start.seconds,
-                        end: result.range.end.seconds))
+                        end: result.range.end.seconds,
+                        runID: runID,
+                        language: language))
                 }
             } catch {
                 guard !Task.isCancelled else { return }
