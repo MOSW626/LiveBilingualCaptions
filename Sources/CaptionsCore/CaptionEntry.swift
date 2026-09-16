@@ -49,6 +49,10 @@ public final class CaptionState {
     public var status = "준비 중…"
     public var fontSize: Double = 20
     public var historyCount = Settings.defaultCaptionHistoryCount
+    /// `CaptionSegmenter`의 안전망 상한. 패널 폭·글자 크기가 바뀔 때만(호출자가)
+    /// `CaptionSegmenter.recommendedCap`으로 다시 계산해 여기 채운다 — 문장마다
+    /// 재계산하지 않는다(그 비용은 `CaptionSegmenter.recommendedCap`의 문서 참고).
+    public var segmentCap = CaptionSegmenter.defaultCap
     public var isRunning = false
     /// 시작/정지 버튼 제목. "정지 중…", "다시 시작" 같은 중간 상태까지 그대로 보여준다.
     public var toggleTitle = "시작"
@@ -107,7 +111,7 @@ public final class CaptionState {
     public func apply(_ event: TranscriptEvent, runID: Int = 0) -> [CaptionRowUpdate] {
         let update = latest.apply(event)
         var results: [CaptionRowUpdate] = []
-        let segments = CaptionSegmenter.segment(update.text, isFinal: event.isFinal)
+        let segments = CaptionSegmenter.segment(update.text, isFinal: event.isFinal, cap: segmentCap)
         for (index, segment) in segments.enumerated() {
             let id: UUID
             if update.isOutdated {

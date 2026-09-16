@@ -1,3 +1,4 @@
+import CoreGraphics
 import Testing
 @testable import CaptionsCore
 
@@ -83,4 +84,44 @@ import Testing
     #expect(grown[0] == first[0]) // 이미 완결된 앞 문장은 텍스트·완결 여부 모두 그대로다
     #expect(grown[1].text == "아직 끝나지 않은 두 번째 문장입니다.")
     #expect(grown[1].isComplete)
+}
+
+// MARK: - recommendedCap — 안전망 상한을 패널 폭·글자 크기에서 실측으로 도출한다
+//
+// "여전히 문장이 길어. 폭을 키우고 싶어"의 핵심: 폭 컨트롤만 추가하고 안전망이 상수
+// 그대로면 넓어진 패널엔 빈 공간만 남고 줄 길이는 그대로다. 이 세 테스트가 그 연결을
+// 고정한다 — 폭이 커지면 상한도 커지고, 글자가 커지면 상한은 작아지고, 극단값에서도
+// 바닥/천장을 벗어나지 않는다.
+
+@Test func 넓은_패널일수록_안전망_상한이_커진다() {
+    let narrow = CaptionSegmenter.recommendedCap(panelWidth: 560, fontSize: 20)
+    let wide = CaptionSegmenter.recommendedCap(panelWidth: 1200, fontSize: 20)
+    #expect(wide > narrow)
+}
+
+@Test func 글자가_클수록_같은_폭에서_안전망_상한이_작아진다() {
+    let smallFont = CaptionSegmenter.recommendedCap(panelWidth: 700, fontSize: 14)
+    let bigFont = CaptionSegmenter.recommendedCap(panelWidth: 700, fontSize: 40)
+    #expect(smallFont > bigFont)
+}
+
+@Test func 안전망_상한은_바닥_밑으로_내려가지_않는다() {
+    // 극단적으로 좁은 폭 + 큰 글자: 실측 그대로면 한 줄에 글자 한두 개도 안 들어갈 수
+    // 있다 — 그러면 매 줄이 단어 하나조차 못 담는다. capFloor가 막는다.
+    let cap = CaptionSegmenter.recommendedCap(panelWidth: 1, fontSize: 200)
+    #expect(cap >= CaptionSegmenter.capFloor)
+}
+
+@Test func 안전망_상한은_천장_위로_넘치지_않는다() {
+    // 극단적으로 넓은 폭 + 작은 글자: 실측 그대로면 안전망이 사실상 무제한이 된다 —
+    // capCeiling이 막는다.
+    let cap = CaptionSegmenter.recommendedCap(panelWidth: 100_000, fontSize: 1)
+    #expect(cap <= CaptionSegmenter.capCeiling)
+}
+
+@Test func 기본_패널_폭과_글자_크기의_상한은_합리적인_범위_안이다() {
+    // 기존 상수(48)를 그대로 재현하진 않지만(실측이 더 정확하다), 같은 자릿수여야
+    // 한다 — 터무니없이 크거나 작으면 실측 자체가 잘못됐다는 신호다.
+    let cap = CaptionSegmenter.recommendedCap(panelWidth: PanelFrame.defaultWidth, fontSize: 20)
+    #expect((30...80).contains(cap))
 }

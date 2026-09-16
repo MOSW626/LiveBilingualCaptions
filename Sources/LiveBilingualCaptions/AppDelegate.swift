@@ -29,6 +29,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var settingsWindow: NSWindow?
     private var moveObserver: NSObjectProtocol?
     private var resizeObserver: NSObjectProtocol?
+    /// 리사이즈 핸들 드래그 시작 시점의 패널 폭. 드래그 중엔 여기 누적 이동량을 더해
+    /// 목표 폭을 구한다(델타를 계속 더하면 반올림 오차가 쌓인다). 드래그가 끝나면 nil로
+    /// 돌아가 다음 드래그가 그때의 실제 폭에서 다시 시작한다.
+    private var resizeStartWidth: CGFloat?
     private var running = false
     private var clearTask: Task<Void, Never>?
     /// 자막은 지연에 민감하다 — 가장 빠른 Haiku 계열을 쓴다. 날짜 접미사를 붙이지 않는다.
@@ -81,6 +85,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         state.fontSize = settings.fontSize
         state.historyCount = settings.captionHistoryCount
         state.audioSourceName = settings.audioSource.displayName
+        state.segmentCap = CaptionSegmenter.recommendedCap(
+            panelWidth: settings.panelWidth ?? PanelFrame.defaultWidth, fontSize: settings.fontSize)
         translator.preferredTargetID = settings.preferredTargetID
         currentLanguage = resolveCurrentLanguage(for: settings.languageMode) // didSet이 syncLanguage()를 부른다
         refreshLanguagePairAvailability()
@@ -191,6 +197,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         state.fontSize = new.fontSize
         state.historyCount = new.captionHistoryCount
         state.audioSourceName = new.audioSource.displayName
+        // 안전망 상한은 폭·글자 크기가 실제로 바뀔 때만 다시 잰다(§ 일반 원칙: 실시간
+        // 스레드는 물론 문장마다도 재계산하지 않는다) — CTLine 실측 비용을 여기서만 쓴다.
+        if old.panelWidth != new.panelWidth || old.fontSize != new.fontSize {
+            state.segmentCap = CaptionSegmenter.recommendedCap(
+                panelWidth: new.panelWidth ?? PanelFrame.defaultWidth, fontSize: new.fontSize)
+        }
         translator.preferredTargetID = new.preferredTargetID
         syncLanguage() // preferredTargetID만 바뀌어도 대상 언어가 달라질 수 있다
         if old.refinementEnabled != new.refinementEnabled { updateRefiner() }
@@ -379,7 +391,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             onCycleLanguage: { [weak self] in self?.cycleLanguage() },
             onCycleAudioSource: { [weak self] in self?.cycleAudioSource() },
             onQuit: { [weak self] in self?.quitApp() },
-            onHeight: { [weak self] height in self?.fitPanel(toContentHeight: height) })
+            onHeight: { [weak self] height in self?.fitPanel(toContentHeight: height) },
+            onResizeChanged: { [weak self] translationX in self?.resizePanel(translationX: translationX) },
+            onResizeEnded: { [weak self] in self?.resizeStartWidth = nil })
         let hosting = NSHostingView(rootView: overlay)
         hosting.frame = NSRect(origin: .zero, size: frame.size)
         panel.contentView = hosting
@@ -428,6 +442,29 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let clampedFrame = PanelFrame.clamped(
             origin: panel.frame.origin,
             size: CGSize(width: panel.frame.width, height: height),
+            visibleFrame: visibleFrame)
+        panel.setFrame(clampedFrame, display: true)
+    }
+
+    /// 리사이즈 핸들 드래그를 패널 폭에 반영한다. 높이·origin은 건드리지 않는다 — 폭만
+    /// 사용자가 바꾸는 값이고, 높이는 여전히 내용이 정한다(Task 7의 자동 성장). 클램프는
+    /// `PanelFrame.clamped`가 하는 그대로다(최소 폭 = `PanelFrame.minWidth`로 버튼 행이
+    /// 항상 들어가고, 최대 폭 = 현재 화면 `visibleFrame`을 넘지 않는다) — 리사이즈 전용
+    /// 클램프를 새로 만들지 않는다.
+    ///
+    /// 이 경로는 patch를 직접 저장하지 않는다: `panel.setFrame`이 `NSWindow.
+    /// didResizeNotification`을 발생시키고, 이미 구독 중인 `observePanelGeometry`가
+    /// `persistPanelGeometry()` → `apply(_:)`로 흘려보낸다 — 창 이동(배경 드래그)이
+    /// 저장되는 경로와 완전히 같다. 그래서 폭 변경도 다른 설정과 똑같이 **하나뿐인**
+    /// 적용 경로를 탄다.
+    private func resizePanel(translationX: CGFloat) {
+        guard let panel else { return }
+        let base = resizeStartWidth ?? panel.frame.width
+        resizeStartWidth = base
+        let visibleFrame = (panel.screen ?? NSScreen.main)?.visibleFrame ?? panel.frame
+        let clampedFrame = PanelFrame.clamped(
+            origin: panel.frame.origin,
+            size: CGSize(width: base + translationX, height: panel.frame.height),
             visibleFrame: visibleFrame)
         panel.setFrame(clampedFrame, display: true)
     }

@@ -11,6 +11,13 @@ struct CaptionOverlay: View {
     var onQuit: () -> Void
     /// 내용 높이를 창에게 알린다. 자막이 쌓이면 창이 위로 자라야 한다.
     var onHeight: (CGFloat) -> Void
+    /// 리사이즈 핸들 드래그 중. 제스처 시작점부터의 누적 수평 이동량(포인트)을 매
+    /// 갱신마다 넘긴다 — 델타가 아니라 누적값이라 호출자가 드래그 시작 시점의 폭에
+    /// 그대로 더하면 된다(작은 델타를 계속 누적하면 반올림 오차가 쌓인다).
+    var onResizeChanged: (CGFloat) -> Void
+    /// 드래그가 끝났다. 다음 드래그가 그 시점의 실제 폭에서 다시 시작하도록 호출자가
+    /// 기준값을 지우는 신호다.
+    var onResizeEnded: () -> Void
 
     /// 언어팩이 없으면 이 설정이 non-nil 이 되고, .translationTask 가 다운로드 시트를 띄운다.
     /// SwiftUI 로 그리는 이유가 이 한 줄이다.
@@ -79,6 +86,26 @@ struct CaptionOverlay: View {
         }
         .task(id: "\(state.sourceLanguage.id)-\(state.targetLanguage.id)") {
             await requestPackIfNeeded()
+        }
+        // 리사이즈 핸들. 패널이 `.borderless`라 시스템 리사이즈 가장자리가 없다 — 이
+        // 손잡이가 유일한 드래그-리사이즈 진입점이다. 모서리에 작게 둔다: 다른 사람의
+        // 발표 위에 떠 있는 창이라 화려하면 안 되지만, 완전히 숨으면 리사이즈가 가능한지
+        // 아무도 모른다. 히트 영역은 아이콘보다 넉넉히(패딩 8pt) 둬서 작은 아이콘이라도
+        // 잡기 쉽게 한다. 배경 어디든 클릭하면 `isMovableByWindowBackground`가 창을
+        // 옮기는 것과 달리, 이 아이콘 위 클릭은 여기 붙은 제스처가 먼저 가져가므로
+        // 창 이동과 부딪히지 않는다(버튼들과 같은 원리).
+        .overlay(alignment: .bottomTrailing) {
+            Image(systemName: "arrow.left.and.right")
+                .font(.system(size: 10, weight: .semibold))
+                .foregroundStyle(.white.opacity(0.35))
+                .padding(8)
+                .contentShape(Rectangle())
+                .gesture(
+                    DragGesture(minimumDistance: 1, coordinateSpace: .global)
+                        .onChanged { onResizeChanged($0.translation.width) }
+                        .onEnded { _ in onResizeEnded() }
+                )
+                .help("드래그해서 패널 폭 조절")
         }
     }
 

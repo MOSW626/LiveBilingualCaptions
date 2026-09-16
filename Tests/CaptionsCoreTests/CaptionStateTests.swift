@@ -311,3 +311,14 @@ private func event(_ utteranceID: Int, _ text: String, isFinal: Bool = true,
     #expect(state.entries[0].translated == "번역:첫 문장입니다.")
     #expect(state.entries[1].translated == "번역:둘째 문장입니다.")
 }
+
+// `segmentCap`을 낮추면(좁은 패널·큰 글자를 흉내) 같은 문장부호 없는 텍스트가 더
+// 일찍 끊겨야 한다 — 폭 컨트롤이 실제로 세그멘테이션에 연결돼 있다는 배선 확인.
+@Test @MainActor func segmentCap을_낮추면_더_일찍_끊긴다() {
+    let text = "이것은 문장부호가 전혀 없이 아주 길게 이어지는 발화의 예시 텍스트입니다"
+    let state = CaptionState()
+    state.segmentCap = 8
+    let updates = state.apply(event(0, text, isFinal: false))
+    #expect(updates.count > 1)
+    #expect(updates[0].transcript.text.count <= 8)
+}
