@@ -28,6 +28,12 @@ struct SettingsView: View {
                         Text($0.displayName).tag($0)
                     }
                 }
+                // 원문 자막이 늦게 뜬다는 불만은 대개 음성 감지(VAD)가 "이건 말이다"라고
+                // 판단하는 데 걸리는 시간 때문이다. 무엇을 눌러야 할지 짐작하게 두지 않고
+                // 증상과 조치를 직접 연결한다.
+                Text("자막이 늦거나 주변이 시끄러우면 '낮음'을 먼저 시도하세요. 애매한 소리도 말로 더 빨리 인정해 반응이 빨라지지만, 오작동(엉뚱하게 자막이 뜨는 것)도 늘 수 있습니다. '높음'은 확실한 소리만 말로 인정해 오작동은 줄지만 반응이 늦어질 수 있습니다.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
             }
             Section("언어") {
                 Picker("인식 언어", selection: languageSelection) {

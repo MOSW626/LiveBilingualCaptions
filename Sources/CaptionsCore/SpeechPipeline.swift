@@ -61,6 +61,21 @@ public struct PipelineEvent: Sendable, Equatable {
     }
 }
 
+// MARK: - 지연 계측 (LBC_TIMING=1)
+
+/// 평소엔 완전히 꺼져 있는 지연 로그. 환경 변수는 정적 초기화 시 1번만 읽는다.
+/// 실시간 오디오 콜백에서 쓰는 건 `AudioSinkGate`의 타임스탬프 기록 한 줄뿐이고,
+/// 그마저 `enabled`가 꺼져 있으면 평가되지 않는다 — 포맷팅·stderr 쓰기는 전부
+/// 콜백 밖(`consume`, 시작 절차)에서 일어난다.
+enum LatencyTiming {
+    static let enabled = ProcessInfo.processInfo.environment["LBC_TIMING"] == "1"
+
+    static func log(_ message: @autoclosure () -> String) {
+        guard enabled else { return }
+        FileHandle.standardError.write(Data("[LBC_TIMING] \(message())\n".utf8))
+    }
+}
+
 public enum PipelineError: LocalizedError, Equatable {
     case unsupportedLanguage(String)
     case noCompatibleFormat
@@ -319,6 +334,9 @@ public final class AudioSinkGate: @unchecked Sendable {
     private let lock = NSLock()
     private var queue: AudioInputQueue?
     private var enabled = true
+    /// LBC_TIMING 전용: 이 실행에서 오디오가 sink에 처음 닿은 벽시계 시각. 발화별
+    /// 시작 시각은 이 값 + `chunk.start`(오디오 상대 시각)로 근사한다.
+    private var firstIngestTime: Date?
 
     public init() {}
 
@@ -334,11 +352,21 @@ public final class AudioSinkGate: @unchecked Sendable {
         lock.unlock()
     }
 
+    /// 실시간 오디오 콜백에서 불린다. `LatencyTiming.enabled`가 꺼져 있으면
+    /// `&&`의 단락 평가로 `Date()`조차 만들지 않는다 — 락 안에서 하는 일은
+    /// 이미 있던 대입 하나뿐, 새 락도 포매팅도 없다.
     public func ingest(_ buffer: AVAudioPCMBuffer) {
         lock.lock()
         let target = enabled ? queue : nil
+        if LatencyTiming.enabled, firstIngestTime == nil { firstIngestTime = Date() }
         lock.unlock()
         target?.ingest(buffer)
+    }
+
+    /// LBC_TIMING 전용 판독. 오디오 스레드 밖(`consume`)에서만 부른다.
+    public func captureAnchor() -> Date? {
+        lock.lock(); defer { lock.unlock() }
+        return firstIngestTime
     }
 }
 
@@ -510,6 +538,7 @@ public final class SpeechPipeline {
         if negotiated == nil { negotiated = await session.bestAudioFormat(considering: nil) }
         guard let analysisFormat = negotiated else { throw PipelineError.noCompatibleFormat }
         try checkAlive(run)
+        LatencyTiming.log("협상된 분석 포맷: \(analysisFormat)")
 
         let queue = AudioInputQueue(analysisFormat: analysisFormat)
         run.queue = queue
@@ -557,10 +586,16 @@ public final class SpeechPipeline {
     }
 
     private func consume(_ results: AsyncThrowingStream<TranscriptionChunk, any Error>, run: Run) async {
+        // LBC_TIMING 전용, 이 루프에만 사는 로컬 상태 — 발화마다 첫 부분결과 시각을
+        // 기억해뒀다가 최종이 오면 지운다. 꺼져 있으면 절대 채워지지 않는다.
+        var firstPartialAt: [Int: Date] = [:]
         do {
             for try await chunk in results {
                 guard current === run else { return }
                 let assignment = run.ledger.assign(start: chunk.start, end: chunk.end, isFinal: chunk.isFinal)
+                if LatencyTiming.enabled {
+                    logTiming(run: run, chunk: chunk, assignment: assignment, firstPartialAt: &firstPartialAt)
+                }
                 let transcript: Transcript = chunk.isFinal ? .final(chunk.text) : .partial(chunk.text)
                 emit(run.id, .transcript(TranscriptEvent(
                     utteranceID: assignment.id,
@@ -571,6 +606,28 @@ public final class SpeechPipeline {
         } catch {
             guard current === run, !(error is CancellationError) else { return }
             emit(run.id, .failed(message: error.localizedDescription))
+        }
+    }
+
+    /// 발화 시작 시각은 `gate.captureAnchor()`(오디오가 sink에 처음 닿은 벽시계 시각)에
+    /// `chunk.start`(그 발화가 시작하는 오디오 상대 시각)를 더해 근사한다 — 마이크
+    /// 캡처는 실시간이라 오디오 상대 시각과 벽시계 경과 시각이 거의 같다는 전제다.
+    private func logTiming(
+        run: Run, chunk: TranscriptionChunk, assignment: UtteranceLedger.Assignment,
+        firstPartialAt: inout [Int: Date]
+    ) {
+        let now = Date()
+        if firstPartialAt[assignment.id] == nil {
+            firstPartialAt[assignment.id] = now
+            if let anchor = run.gate?.captureAnchor() {
+                let audioStartWallClock = anchor.addingTimeInterval(chunk.start)
+                let ms = Int(now.timeIntervalSince(audioStartWallClock) * 1000)
+                LatencyTiming.log("발화#\(assignment.id) 첫 인식까지 \(ms)ms (오디오 시작 → 첫 부분결과)")
+            }
+        }
+        if chunk.isFinal, let firstPartial = firstPartialAt.removeValue(forKey: assignment.id) {
+            let ms = Int(now.timeIntervalSince(firstPartial) * 1000)
+            LatencyTiming.log("발화#\(assignment.id) 확정까지 \(ms)ms (첫 부분결과 → 최종)")
         }
     }
 
@@ -689,7 +746,11 @@ actor SystemSpeechSession: SpeechSession {
         SpeechTranscriber(
             locale: locale,
             transcriptionOptions: [],
-            reportingOptions: [.volatileResults],
+            // .fastResults: 지연을 줄이는 저지연 보고 모드. .volatileResults와 함께 켜야
+            // 원문 줄(부분결과)이 더 빨리 뜬다. SDK 인터페이스에서 두 옵션 다
+            // SpeechTranscriber.ReportingOption에 있는 걸 확인했다(DictationTranscriber의
+            // .frequentFinalization과 혼동하지 말 것).
+            reportingOptions: [.volatileResults, .fastResults],
             attributeOptions: [])
     }
 

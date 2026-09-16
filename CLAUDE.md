@@ -11,6 +11,9 @@ macOS 26 전용 실시간 양국어 자막 오버레이. 본인 맥 전용(배�
   오디오 스레드 등 다른 스레드에서 불려 SIGTRAP 나는 것)을 잡지 못한다** — 프로세스를
   실제로 띄우지 않기 때문이다. 오디오 캡처 콜백, 스레드 전환 배선을 건드렸다면
   `./test.sh` 가 통과해도 반드시 이것도 돌릴 것.
+- 지연 측정: `LBC_TIMING=1 "dist/Live Bilingual Captions.app/Contents/MacOS/LiveBilingualCaptions"`
+  — 발화별 "오디오 시작 → 첫 부분결과", "첫 부분결과 → 최종" 지연(ms)과 협상된 분석
+  포맷을 stderr에 찍는다. 평소엔 완전히 꺼져 있다(환경 변수 미설정 시 비용 없음).
 
 ## 환경 제약
 - 전체 Xcode 없음 → **XCTest 사용 불가.** swift-testing 전용.
