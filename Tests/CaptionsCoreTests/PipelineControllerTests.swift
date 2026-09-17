@@ -1365,3 +1365,64 @@ let autoConfig = PipelineConfiguration(source: .microphone, language: .korean, s
     }
     #expect(harness.transcripts.map(\.text) == ["고정 모드 문장"])
 }
+
+// 버그 회귀(en.aiff 실측 프로브에서 재현): 승자가 이미 정해진 뒤에도 진 쪽 전사기가
+// 뒤늦게 "처음부터 끝까지"를 한 덩어리로 오인식한 final을 내보낼 수 있다(그 언어로
+// 듣기엔 말이 안 되는 오디오라 문장 경계를 하나도 못 찾고 전체를 한 발화로 묶는다).
+// 그 덩어리가 짝 없이 채택돼 승자의 세 번째 문장 뒤에 엉뚱한 네 번째 줄로 붙었다 —
+// 사용자에게는 "영어가 이상한 줄로 끝난다"로 보였다. 짝 없는 final은 이미 채택된
+// 구간보다 한참 앞에서 시작하면(진 쪽의 뒤늦은 덩어리) 버리고, 승자의 나머지 문장들은
+// (짝이 없어도 새 구간이면) 전부 반영돼야 한다. grace 타이머 없이도(=NeverGraceClock)
+// "다음 final이 짝이 아니다" 경로만으로 전부 결정되게 짰다 — 실시간 대기가 필요 없다.
+@Test @MainActor func 승자의_연속된_세_final은_전부_반영되고_진_쪽의_뒤늦은_통짜_final은_버려진다() async {
+    let harness = Harness()
+    harness.controller.requestStart(configuration: autoConfig)
+    await harness.waitUntilListening()
+    let ko = harness.engine.sessions.wrapped[0]
+    let en = harness.engine.sessions.wrapped[1]
+
+    // 첫 문장 — 짝을 맞춰 영어가 이긴다(승자 확정).
+    en.emit("Hello, everyone.", isFinal: true, start: 0, end: 1, confidence: 0.9)
+    ko.emit("garbage1", isFinal: true, start: 0, end: 1, confidence: 0.3)
+    await harness.waitForEvent {
+        if case .transcript(let e) = $0.kind { return e.text == "Hello, everyone." }
+        return false
+    }
+
+    // 두 번째 문장 — 진 쪽의 partial은 이미 승자가 있어서 버려진다.
+    en.emit("Let us start today's meeting.", isFinal: false, start: 1.08, end: 2)
+    ko.emit("안 들림", isFinal: false, start: 1.08, end: 2)
+    en.emit("Let us start today's meeting.", isFinal: true, start: 1.08, end: 3.0, confidence: 0.9)
+    ko.emit("garbage2", isFinal: true, start: 1.08, end: 3.0, confidence: 0.3)
+    await harness.waitForEvent {
+        if case .transcript(let e) = $0.kind { return e.text == "Let us start today's meeting." }
+        return false
+    }
+
+    // 세 번째 문장 — 이번엔 진 쪽이 짝을 안 준다(승자 final은 짝 없이 새 구간이라
+    // 그대로 채택돼야 한다). 그 대신 한참 뒤에 처음부터 끝까지 통째로 오인식한
+    // 덩어리 final을 내보낸다(실제 버그 재현). 세 번째 문장의 짝-없음은 뒤이어 오는
+    // 그 덩어리가 "짝이 아니다"로 판정되면서 함께 흘러나온다.
+    en.emit("The 1st item is the schedule.", isFinal: true, start: 3.06, end: 5.34, confidence: 0.9)
+    ko.emit("hello everyone let a star today meeting the first item is the schedule",
+            isFinal: true, start: 0, end: 5.76, confidence: 0.8)
+    await harness.waitForEvent {
+        if case .transcript(let e) = $0.kind { return e.text == "The 1st item is the schedule." }
+        return false
+    }
+
+    // 덩어리가 버려졌다는 걸 "아직 안 왔을 뿐"과 구별하려면 뒤이은 정상 발화가
+    // 필요하다 — 그 발화가 도착하면 덩어리는 이미 "짝이 아니다" 경로로 처리된 뒤다.
+    en.emit("epilogue", isFinal: true, start: 6, end: 6.5, confidence: 0.9)
+    ko.emit("정크", isFinal: true, start: 6, end: 6.5, confidence: 0.2)
+    await harness.waitForEvent {
+        if case .transcript(let e) = $0.kind { return e.text == "epilogue" }
+        return false
+    }
+
+    let finals = harness.transcripts.filter(\.isFinal)
+    #expect(finals.map(\.text) == [
+        "Hello, everyone.", "Let us start today's meeting.", "The 1st item is the schedule.", "epilogue",
+    ])
+    #expect(finals.allSatisfy { $0.sourceLanguage == .english })
+}

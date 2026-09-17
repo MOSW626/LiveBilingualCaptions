@@ -616,6 +616,11 @@ actor DualArbitrator {
     private var winner: CaptionLanguage
     /// 승자를 한 번이라도 확정했는지. false인 동안은 partial을 언어로 거르지 않는다.
     private var hasWinner = false
+    /// 지금까지 채택한 final들이 덮은 오디오 구간의 끝(초). 짝 없이 채택하는 길(§2
+    /// "한쪽 실패")에서만 쓴다 — 진 쪽 전사기가 뒤늦게 통째로 내보내는 큰 덩어리 final
+    /// (예: 처음부터 끝까지 한 발화로 묶은 오인식)이 이미 승자가 끝낸 구간을 다시
+    /// 덮어쓰지 못하게 막는다(버그: 그런 덩어리가 승자 뒤에 엉뚱한 줄로 붙었다).
+    private var adoptedUntil: Double = 0
     private var awaiting: Pending?
     /// `awaiting`을 새로 세울 때마다 올린다. grace 타이머가 뒤늦게 울렸을 때 그사이
     /// 다른 경로(정상 짝맺기·다음 final·sideEnded)로 이미 처리됐는지 이 값으로 가른다.
@@ -654,13 +659,13 @@ actor DualArbitrator {
             }
             // 짝이 아니다 — 같은 쪽이 또 냈거나 시간이 안 맞는다. 기다리던 것부터 흘려보내고
             // 이번 것을 새로 기다린다.
-            adopt(pending.chunk)
+            adoptIfFresh(pending.chunk)
             beginWaiting(side: side, chunk: chunk)
             return
         }
 
         if ended.contains(opposite(of: side)) {
-            adopt(chunk) // 상대는 이미 끝났다 — 짝이 다시는 안 온다. 곧바로 채택한다.
+            adoptIfFresh(chunk) // 상대는 이미 끝났다 — 짝이 다시는 안 온다. 곧바로 채택한다.
         } else {
             beginWaiting(side: side, chunk: chunk)
         }
@@ -673,7 +678,7 @@ actor DualArbitrator {
         if let error { lastError = error }
         if let pending = awaiting {
             clearAwaiting()
-            adopt(pending.chunk)
+            adoptIfFresh(pending.chunk)
         }
         if ended.count >= 2 {
             if let lastError { continuation.finish(throwing: lastError) } else { continuation.finish() }
@@ -699,7 +704,7 @@ actor DualArbitrator {
         guard token == awaitingToken, let pending = awaiting else { return }
         awaiting = nil
         graceTask = nil
-        adopt(pending.chunk)
+        adoptIfFresh(pending.chunk)
     }
 
     /// `awaiting`을 다른 경로(정상 짝맺기·다음 final·sideEnded)로 이미 처리할 때 부른다.
@@ -716,7 +721,22 @@ actor DualArbitrator {
     private func adopt(_ chunk: TranscriptionChunk) {
         winner = chunk.language
         hasWinner = true
+        adoptedUntil = max(adoptedUntil, chunk.end)
         continuation.yield(chunk)
+    }
+
+    /// 짝 없이 채택하는 길에서만 쓴다(버그 수정: 코드 리뷰). 승자가 이미 있고, 이
+    /// 조각의 시작이 이미 채택된 구간보다 한참 앞이면(0.2초 tolerance 밖) — 진 쪽
+    /// 전사기가 뒤늦게 내보낸, 옛 오디오를 통째로 다시 전사한 덩어리일 뿐이다. 버리고
+    /// 승자를 흔들지 않는다. 비교(`decide`)로 정상 채택한 것에는 적용하지 않는다 —
+    /// 거기는 항상 같은 시점 구간을 실제로 겨루고 이긴 것이다.
+    private func adoptIfFresh(_ chunk: TranscriptionChunk) {
+        guard hasWinner, chunk.start < adoptedUntil - tolerance else {
+            adopt(chunk)
+            return
+        }
+        LatencyTiming.log("[자동] \(chunk.language.displayName) 쪽 낡은 final 버림 "
+            + "구간=\(chunk.start)~\(chunk.end) (이미 \(adoptedUntil)까지 채택됨)")
     }
 
     private func opposite(of side: Side) -> Side { side == .a ? .b : .a }

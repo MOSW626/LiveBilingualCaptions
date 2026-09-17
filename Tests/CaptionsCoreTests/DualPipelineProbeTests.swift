@@ -74,10 +74,13 @@ private final class FileAudioSource: AudioSource {
         ?? "/private/tmp/claude-501/-Users-an-yeonsu-Desktop-vivecoding-LiveBilingualCaptions/"
         + "10259627-8632-499d-ad9f-c8945adee815/scratchpad"
 
+    // 버그 회귀(코드 리뷰): en.aiff는 세 문장이다. 전에는 프로브가 첫 final 하나만 보고
+    // 멈춰서(위 참고) "영어는 너무 빨리 끊긴다"는 사용자 신고를 놓쳤다 — 이제는 언어뿐
+    // 아니라 final 개수와 문장 전체를 정확히 고정한다.
     let order = ProcessInfo.processInfo.environment["LBC_DUAL_PROBE_ORDER"] ?? "ko,en"
-    let all: [(file: String, expected: CaptionLanguage)] = [
-        ("ko.aiff", .korean),
-        ("en.aiff", .english),
+    let all: [(file: String, expected: CaptionLanguage, expectedTexts: [String]?)] = [
+        ("ko.aiff", .korean, nil),
+        ("en.aiff", .english, ["Hello, everyone.", "Let us start today's meeting.", "The 1st item is the schedule."]),
     ]
     let cases = order.split(separator: ",").compactMap { key in all.first { $0.file.hasPrefix(key) } }
 
@@ -88,11 +91,15 @@ private final class FileAudioSource: AudioSource {
 
         var finals: [TranscriptEvent] = []
         var stopped = false
-        let gotFinal = Signal()
+        // 버그 회귀: 예전에는 **첫 final 하나**만 기다리고 곧바로 requestStop()을 불러서
+        // 뒤이은 문장들을 잘라먹었다("영어는 너무 빨리 끊긴다" 버그의 원인 — 실제 인식이
+        // 아니라 프로브 자체가 일찍 멈춘 것이었다). 이제는 "마지막 이벤트 이후로 한동안
+        // 조용하다"를 기준으로 멈춘다 — 여러 문장짜리 발화가 전부 끝날 시간을 준다.
+        var lastActivity = Date()
         controller.onEvent = { event in
-            if case .transcript(let e) = event.kind, e.isFinal {
-                finals.append(e)
-                gotFinal.fire()
+            if case .transcript(let e) = event.kind {
+                lastActivity = Date()
+                if e.isFinal { finals.append(e) }
             }
         }
         controller.onState = { state in if state == .stopped { stopped = true } }
@@ -105,16 +112,24 @@ private final class FileAudioSource: AudioSource {
         // 첫 인식은 두 언어 모델을 동시에 준비하느라(신경망 엔진 그래프 컴파일 등) 눈에
         // 띄게 느리다 — 실측으로 60초는 코드 첫 실행도 넉넉히 덮었다(그 뒤로는 13초대).
         let timeoutSeconds = Double(ProcessInfo.processInfo.environment["LBC_DUAL_PROBE_TIMEOUT"] ?? "") ?? 60
-        let timeout = Task { try? await Task.sleep(for: .seconds(timeoutSeconds)); gotFinal.fire() }
-        await gotFinal.wait()
-        timeout.cancel()
+        let quietSeconds = 3.0
+        let deadline = Date().addingTimeInterval(timeoutSeconds)
+        while Date() < deadline {
+            try? await Task.sleep(for: .milliseconds(250))
+            if !finals.isEmpty, Date().timeIntervalSince(lastActivity) > quietSeconds { break }
+        }
 
         controller.requestStop()
         while !stopped { try? await Task.sleep(for: .milliseconds(50)) }
 
         let adopted = finals.first?.sourceLanguage
+        let text = finals.map(\.text).joined(separator: " / ")
         print("[DUAL_PROBE] \(testCase.file) → 채택된 언어: \(adopted?.displayName ?? "없음(타임아웃)") "
-            + "/ 원문: \(finals.first?.text ?? "") / 전체 final 수: \(finals.count)")
+            + "/ 원문(\(finals.count)개): \(text)")
         #expect(adopted == testCase.expected)
+        if let expectedTexts = testCase.expectedTexts {
+            #expect(finals.count == expectedTexts.count)
+            #expect(finals.map(\.text) == expectedTexts)
+        }
     }
 }
