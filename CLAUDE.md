@@ -3,7 +3,10 @@
 macOS 26 전용 실시간 양국어 자막 오버레이. 본인 맥 전용(배포 안 함).
 
 ## 명령
-- 빌드+실행: `./run.sh`
+- **설치: `./install.sh`** → `/Applications` 에 갈아끼운다. 그 뒤로는 Launchpad·Spotlight·
+  Finder 에서 여느 앱처럼 연다. 평소 쓰는 경로는 이것이다.
+- 빌드+실행(개발용): `./run.sh` → `dist/` 의 것을 띄운다. 설치본과 별개다 —
+  **고친 걸 실제로 쓰려면 `./install.sh` 를 돌려야 한다.**
 - 빌드만: `./build.sh` → `dist/Live Bilingual Captions.app`
 - 테스트: `./test.sh` (**맨 `swift test` 는 실패한다** — swift-testing 경로 플래그 필요)
   **절대 두 번 동시에 돌리지 말 것.** SwiftPM 빌드 락을 두고 서로 막혀서, 테스트가
@@ -33,6 +36,11 @@ macOS 26 전용 실시간 양국어 자막 오버레이. 본인 맥 전용(배�
   단순화하면 안 된다(`SpeechPipeline.swift`).
 - 세션 중 확정된 전사에서 반복·고유명사 용어를 뽑아(`ContextHintExtractor`) `SpeechAnalyzer.setContext`로
   먹인다 — 기기 안에서 무료이고 켜고 끄는 설정 없이 항상 켜져 있다(인식이 대화가 길어질수록 좋아진다).
+
+## 아이콘
+`Resources/AppIcon.icns` (원본 `Resources/AppIcon.png`, 1024px). `build.sh` 가 번들의
+`Contents/Resources` 로 복사하고 `Info.plist` 의 `CFBundleIconFile` 이 가리킨다.
+바꾸려면 PNG 를 갈아끼우고 `sips` 로 iconset 을 만든 뒤 `iconutil -c icns` 한다.
 
 ## 코드서명 인증서 만들기 (1회, 권한 유지용)
 ad-hoc 서명은 빌드마다 cdhash 가 바뀌어 마이크·화면기록 권한이 매번 초기화된다.
