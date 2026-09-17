@@ -27,6 +27,8 @@ macOS 26 전용 실시간 양국어 자막 오버레이. 본인 맥 전용(배�
 - 자동 언어 모드는 분석기·전사기·pump를 언어별로 **두 벌** 돌린다 — 실측 제약으로 `SpeechAnalyzer`
   하나에 `SpeechTranscriber` 둘을 물리면 `setWorkers`에서 SIGTRAP 나므로, "분석기 하나 공유"로
   단순화하면 안 된다(`SpeechPipeline.swift`).
+- 세션 중 확정된 전사에서 반복·고유명사 용어를 뽑아(`ContextHintExtractor`) `SpeechAnalyzer.setContext`로
+  먹인다 — 기기 안에서 무료이고 켜고 끄는 설정 없이 항상 켜져 있다(인식이 대화가 길어질수록 좋아진다).
 
 ## 코드서명 인증서 만들기 (1회, 권한 유지용)
 ad-hoc 서명은 빌드마다 cdhash 가 바뀌어 마이크·화면기록 권한이 매번 초기화된다.

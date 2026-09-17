@@ -251,6 +251,9 @@ final class FakeSpeechSession: SpeechSession, @unchecked Sendable {
         /// 실제 세션처럼 교체 커밋 지점(runID)과 확정 지점(language)에서 갈아끼운다.
         var currentRunID = 0
         var currentLanguage: CaptionLanguage = .korean
+        /// `setContext`가 불릴 때마다 넘겨받은 용어 목록을 그대로 쌓는다 — 컨텍스트
+        /// 힌트가 final에서만, 그리고 기대한 용어로 나가는지 테스트가 확인한다.
+        var contextCalls: [[String]] = []
     }
 
     let locale: Locale
@@ -356,6 +359,10 @@ final class FakeSpeechSession: SpeechSession, @unchecked Sendable {
         }
         state.mutate { $0.currentLanguage = language }
         return true
+    }
+
+    func setContext(_ terms: [String]) async {
+        state.mutate { $0.contextCalls.append(terms) }
     }
 
     func finish() async {

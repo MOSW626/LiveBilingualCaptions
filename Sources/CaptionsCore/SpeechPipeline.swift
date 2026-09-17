@@ -553,6 +553,10 @@ public protocol SpeechSession: Sendable {
     /// 달고 나가되, `language`는 교체가 실제로 끝나기 전까지 옛 값으로 남는다 —
     /// 그 문장은 옛 언어로 말해진 것이기 때문이다. 실패하면 아무것도 바꾸지 않는다.
     func setLanguage(_ locale: Locale, runID: Int, language: CaptionLanguage) async throws -> Bool
+    /// 세션이 누적한 용어 힌트를 analyzer에 반영한다(`ContextHintExtractor` 참고). 실시간
+    /// 오디오 스레드가 아니라 consume/pump 태스크에서 `await`로 부른다. 실패해도 무시한다 —
+    /// 인식 품질을 조금 더 올려주는 최적화일 뿐, 실패해도 전사 자체는 그대로 계속된다.
+    func setContext(_ terms: [String]) async
     func finish() async
 }
 
@@ -771,6 +775,12 @@ public final class SpeechPipeline {
         var configuration: PipelineConfiguration
         var language: CaptionLanguage
         var ledger = UtteranceLedger()
+        /// 확정된 전사로 쌓는 용어 힌트(맥락). 실행 재시작 시 새 `Run`과 함께 자연히
+        /// 리셋되고, 언어 hot swap에서는(같은 `Run`이 살아남으므로) 그대로 유지된다.
+        var contextExtractor = ContextHintExtractor()
+        /// 언어별로 마지막 컨텍스트 반영 이후 지나간 final 개수. `contextPushInterval`개마다
+        /// 새 용어가 없어도 한 번 더 민다(순위 변화를 반영하려고).
+        var finalsSincePush: [String: Int] = [:]
         var gate: AudioSinkGate?
         var source: (any AudioSource)?
         var session: (any SpeechSession)?
@@ -1067,6 +1077,8 @@ public final class SpeechPipeline {
                     utteranceID: assignment.id,
                     sourceLanguage: chunk.language,
                     transcript: transcript)))
+                // partial에서는 절대 부르지 않는다(스펙) — final로 확정된 것만 맥락 후보다.
+                if chunk.isFinal { await pushContextIfNeeded(chunk: chunk, run: run) }
             }
         } catch {
             guard current === run, !(error is CancellationError) else { return }
@@ -1094,6 +1106,36 @@ public final class SpeechPipeline {
             let ms = Int(now.timeIntervalSince(firstPartial) * 1000)
             LatencyTiming.log("발화#\(assignment.id) 확정까지 \(ms)ms (첫 부분결과 → 최종)")
         }
+    }
+
+    /// 새 용어가 없어도 이만큼 final이 쌓이면 한 번 더 민다(빈도 순위가 바뀌었을 수 있어서).
+    private static let contextPushInterval = 5
+
+    /// 이 발화의 확정 전사를 `ContextHintExtractor`에 먹이고, 필요하면(새 용어가 생겼거나
+    /// `contextPushInterval`개마다) 그 언어를 맡은 세션에 `setContext`로 반영한다.
+    private func pushContextIfNeeded(chunk: TranscriptionChunk, run: Run) async {
+        let materiallyChanged = run.contextExtractor.ingestFinal(chunk.text, language: chunk.language)
+        let count = (run.finalsSincePush[chunk.language.id] ?? 0) + 1
+        guard materiallyChanged || count >= Self.contextPushInterval else {
+            run.finalsSincePush[chunk.language.id] = count
+            return
+        }
+        run.finalsSincePush[chunk.language.id] = 0
+
+        guard let session = sessionFor(language: chunk.language, run: run) else { return }
+        let terms = run.contextExtractor.terms(for: chunk.language)
+        await session.setContext(terms)
+        LatencyTiming.log("컨텍스트 힌트 반영: \(chunk.language.displayName) \(terms.count)개")
+    }
+
+    /// 이 언어를 실제로 맡고 있는 세션을 고른다. 고정 모드는 세션이 하나뿐이라(언어가
+    /// hot swap으로 바뀌어도) 항상 `run.session`이 맞다. 자동 모드는 두 세션이 각자
+    /// 언어를 고정으로 맡으므로 구성값(`run.configuration`)으로 가른다.
+    private func sessionFor(language: CaptionLanguage, run: Run) -> (any SpeechSession)? {
+        guard run.secondarySession != nil else { return run.session }
+        if language.id == run.configuration.language.id { return run.session }
+        if language.id == run.configuration.secondaryLanguage?.id { return run.secondarySession }
+        return nil
     }
 
     // MARK: 정리
@@ -1313,6 +1355,16 @@ actor SystemSpeechSession: SpeechSession {
         locale = newLocale
         startPump(language: language)
         return true
+    }
+
+    /// `AnalysisContext.contextualStrings[.general]`에 힌트를 담아 반영한다. 이 세션(actor)
+    /// 자체가 이미 audio thread 밖이고, 호출자(`SpeechPipeline.consume`)도 pump 태스크에서
+    /// `await`로 부른다 — sink(실시간 콜백)에서는 절대 부르지 않는다.
+    func setContext(_ terms: [String]) async {
+        guard let analyzer else { return }
+        let context = AnalysisContext()
+        context.contextualStrings = [.general: terms]
+        try? await analyzer.setContext(context)
     }
 
     func finish() async {
