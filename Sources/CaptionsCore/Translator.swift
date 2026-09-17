@@ -1,4 +1,5 @@
 import Foundation
+import Synchronization
 import Translation
 
 /// 확정된 번역문을 문맥을 보고 다듬는 선택적 2단계.
@@ -81,23 +82,31 @@ public final class Translator {
     /// 실제 온디바이스 번역. 언어팩이 없으면 nil 을 돌려주고,
     /// 다운로드 프롬프트는 UI 의 .translationTask 가 맡는다.
     ///
-    /// `.lowLatency` 를 **명시적으로** 요구한다. 기본 전략은 애플이 고르고, 고르는 기준에
-    /// 서버 왕복이 들어갈 수 있다 — 자막은 문장마다 즉시 나와야 하고 오프라인에서도
-    /// 돌아야 하므로 둘 다 받아들일 수 없다. 번역 품질은 선택적 LLM 보정이 맡는다.
-    /// (`Strategy` 는 macOS 26.4 부터다. 그 이전에서는 기본 전략으로 돌아간다.)
+    /// `.lowLatency` 를 먼저 시도한다 — 기본 전략은 애플이 고르고 그 선택지에 서버
+    /// 왕복이 들어갈 수 있는데, 자막은 문장마다 즉시 나와야 하고 오프라인에서도 돌아야
+    /// 한다. 다만 **이 전략은 언어팩과 별개의 자산을 요구한다**: 쌍이 `installed` 여도
+    /// 세션이 `notInstalled` 로 던진다(이 맥에서 실측). 그래서 실패하면 기본 전략으로
+    /// 되돌아가고, 한 번 실패한 뒤에는 다시 시도하지 않는다 — 문장마다 실패를 되풀이하면
+    /// 저지연을 노린 코드가 오히려 지연을 만든다.
     public static let onDevice: TranslateFunction = { text, source, target in
         guard await packStatus(from: source, to: target) == .installed else { return nil }
-        let session: TranslationSession
-        if #available(macOS 26.4, *) {
-            session = TranslationSession(
-                installedSource: source.locale.language, target: target.locale.language,
-                preferredStrategy: .lowLatency)
-        } else {
-            session = TranslationSession(
-                installedSource: source.locale.language, target: target.locale.language)
+        let sourceLanguage = source.locale.language
+        let targetLanguage = target.locale.language
+
+        if #available(macOS 26.4, *), lowLatencyUsable.withLock({ $0 }) {
+            let fast = TranslationSession(installedSource: sourceLanguage, target: targetLanguage,
+                                          preferredStrategy: .lowLatency)
+            do { return try await fast.translate(text).targetText }
+            catch { lowLatencyUsable.withLock { $0 = false } }
         }
+
+        let session = TranslationSession(installedSource: sourceLanguage, target: targetLanguage)
         return try? await session.translate(text).targetText
     }
+
+    /// 저지연 전략을 아직 쓸 만한가. 첫 실패에서 영구히 꺼진다(되돌리는 경로는 앱 재시작).
+    /// 실패는 자산 유무라 세션마다 달라지지 않는다.
+    private nonisolated static let lowLatencyUsable = Mutex(true)
 
     public static func packStatus(from source: CaptionLanguage,
                                   to target: CaptionLanguage) async -> PackStatus {

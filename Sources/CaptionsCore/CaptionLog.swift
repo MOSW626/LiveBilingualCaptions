@@ -14,6 +14,14 @@ public final class CaptionLog {
     /// 남기지 않게. 그래서 파일명의 시각은 "앱을 켠 때"가 아니라 "첫 자막"이다.
     private var handle: FileHandle?
     private var failed = false
+    /// 이미 기록한 줄. 밀려난 줄에 **뒤늦은 final 이 오면** `CaptionState.upsert` 가 그 줄을
+    /// 같은 ID로 다시 붙여 넣고, 그러면 같은 문장이 한 번 더 밀려나 두 번 쓰인다(실측:
+    /// 2026-09-17 로그에 같은 두 문장이 중복). 내용이 그대로면 건너뛰고, 달라졌으면
+    /// 갱신이므로 다시 쓴다.
+    private var logged: [(id: UUID, text: String)] = []
+    /// 화면에 남을 수 있는 줄 수(최대 10)보다 넉넉하면 충분하다 — 그보다 오래된 줄이
+    /// 되돌아올 경로가 없다.
+    private static let dedupeWindow = 32
     private let directory: URL
     private let now: () -> Date
 
@@ -35,6 +43,10 @@ public final class CaptionLog {
     public func append(_ entry: CaptionEntry, spokenAt: Date) {
         let original = entry.original.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !original.isEmpty else { return }
+        if let seen = logged.first(where: { $0.id == entry.id }), seen.text == original { return }
+        logged.removeAll { $0.id == entry.id }
+        logged.append((entry.id, original))
+        if logged.count > Self.dedupeWindow { logged.removeFirst(logged.count - Self.dedupeWindow) }
         var line = "[\(Self.stamp.string(from: spokenAt))] \(original)\n"
         let translated = entry.translated.trimmingCharacters(in: .whitespacesAndNewlines)
         if !translated.isEmpty { line += "           \(translated)\n" }

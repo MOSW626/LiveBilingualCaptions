@@ -70,6 +70,30 @@ struct CaptionLogTests {
         #expect(!FileManager.default.fileExists(atPath: dir.path))
     }
 
+    @Test("밀려난 줄이 되돌아와 다시 밀려나도 한 번만 쓴다")
+    func skipsRepeatOfIdenticalLine() throws {
+        let dir = tempDirectory()
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let log = CaptionLog(directory: dir, now: fixedClock("2026-09-17 18:10:00"))
+        let id = UUID()
+        let at = fixedClock("2026-09-17 18:10:14")()
+
+        log.append(CaptionEntry(id: id, original: "같은 문장", translated: "same", isFinal: true), spokenAt: at)
+        log.append(CaptionEntry(id: id, original: "같은 문장", translated: "same", isFinal: true), spokenAt: at)
+        // 내용이 자란 뒤늦은 final 은 갱신이므로 다시 쓴다.
+        log.append(CaptionEntry(id: id, original: "같은 문장 더 있음", translated: "same, more", isFinal: true), spokenAt: at)
+        log.close()
+
+        let text = try String(contentsOf: #require(log.fileURL), encoding: .utf8)
+        #expect(text == """
+        [18:10:14] 같은 문장
+                   same
+        [18:10:14] 같은 문장 더 있음
+                   same, more
+
+        """)
+    }
+
     @Test("쓸 수 없는 경로여도 던지지 않는다")
     func survivesUnwritableDirectory() {
         let log = CaptionLog(directory: URL(fileURLWithPath: "/dev/null/nope"),
