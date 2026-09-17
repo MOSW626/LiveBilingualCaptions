@@ -48,7 +48,22 @@ public final class Translator {
     /// 긴 세션에서 무한히 자라지 않게 하고, 밀려나는 줄의 작업은 그때 취소한다.
     static let lineLimit = Settings.captionHistoryCountRange.upperBound + 4
     private var refinedIDs: [UUID] = []
-    private var recentFinals: [String] = []
+
+    /// 원문 한 문장과 그 문장에 실제로 채택된(화면에 남은) 번역의 쌍.
+    /// 보정기가 용어·톤을 앞선 문장들과 맞출 수 있도록 문맥으로 건넨다.
+    private struct ContextPair {
+        let captionID: UUID
+        let sourceLangID: String
+        let source: String
+        var translated: String
+    }
+    /// 문맥으로 실제 사용하는 최근 문장 수. 너무 적으면 문맥이 없는 것과 같고,
+    /// 너무 크면 프롬프트가 비대해져 지연이 늘고 오래된 용어가 섞여 들어온다.
+    static let contextWindowSize = 8
+    /// 원시 보관량은 창보다 넉넉히 둔다 — 세션 중 원문 언어가 바뀌어도(드묾) 필터링 후
+    /// 같은 언어끼리 최근 8개를 채울 여유를 남기기 위해서다.
+    private static let contextHistoryCapacity = contextWindowSize * 2
+    private var contextHistory: [ContextPair] = []
 
     public var preferredTargetID: String?
     public var refiner: TranslationRefiner? {
@@ -90,7 +105,7 @@ public final class Translator {
         for line in lines { line.pending?.cancel() }
         lines.removeAll()
         refinedIDs.removeAll()
-        recentFinals.removeAll()
+        contextHistory.removeAll()
     }
 
     /// 해당 줄의 진행 중 작업만 끊는다.
@@ -175,9 +190,14 @@ public final class Translator {
               isCurrent(ticket, for: captionID) else { return }
         onTranslation?(draft, false, captionID)
         guard isCurrent(ticket, for: captionID), isFinal, !refinedIDs.contains(captionID) else { return }
-        let context = recentFinals // 현재 문장을 '직전 문장들'에 중복해서 넣지 않는다
-        recentFinals.append(text)
-        if recentFinals.count > 3 { recentFinals.removeFirst() }
+        // 현재 문장을 '직전 문장들'에 중복해서 넣지 않는다 — 필터·창은 여기서 한 번에.
+        let context = contextHistory
+            .filter { $0.sourceLangID == source.id }
+            .suffix(Self.contextWindowSize)
+            .map { "원문: \($0.source)\n번역: \($0.translated)" }
+        contextHistory.append(ContextPair(captionID: captionID, sourceLangID: source.id,
+                                          source: text, translated: draft))
+        if contextHistory.count > Self.contextHistoryCapacity { contextHistory.removeFirst() }
         guard let refiner else { return }
         refinedIDs.append(captionID)
         if refinedIDs.count > 256 { refinedIDs.removeFirst() }
@@ -186,6 +206,10 @@ public final class Translator {
               isCurrent(ticket, for: captionID), !improved.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
               improved != draft
         else { return }
+        // 채택된 번역으로 갱신해둬야 다음 문장의 문맥이 다듬어진 쪽을 본다.
+        if let i = contextHistory.firstIndex(where: { $0.captionID == captionID }) {
+            contextHistory[i].translated = improved
+        }
         onTranslation?(improved, true, captionID)
     }
 }

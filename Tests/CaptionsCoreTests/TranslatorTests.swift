@@ -11,6 +11,16 @@ private actor SpyRefiner: TranslationRefiner {
     func recorded() -> [String] { calls }
 }
 
+/// 매 호출의 `context` 배열을 순서대로 기록한다 — 문맥 창이 제대로 좁혀·채워지는지 보려고.
+private actor ContextSpyRefiner: TranslationRefiner {
+    private var contexts: [[String]] = []
+    func refine(_ draft: String, source: String, context: [String]) async throws -> String {
+        contexts.append(context)
+        return draft + " (보정됨)"
+    }
+    func recordedContexts() -> [[String]] { contexts }
+}
+
 /// 언어팩과 무관하게 항상 같은 값을 주는 가짜 번역기.
 private let fakeTranslate: TranslateFunction = { text, _, _ in "[번역] " + text }
 
@@ -79,6 +89,66 @@ private let fakeTranslate: TranslateFunction = { text, _, _ in "[번역] " + tex
     await translator.handle(.final("네"), from: .korean, captionID: UUID())
     await translator.handle(.final("네"), from: .korean, captionID: UUID())
     #expect(await spy.recorded().count == 2)
+}
+
+// MARK: - 문맥 창: 원문·채택된 번역 쌍을 순서대로, 상한 안에서, 같은 언어만
+
+@Test @MainActor func 보정기는_직전_원문과_채택된_번역을_쌍으로_순서대로_받는다() async {
+    let spy = ContextSpyRefiner()
+    let translator = Translator(table: .default, translate: fakeTranslate)
+    translator.refiner = spy
+
+    await translator.handle(.final("첫 문장"), from: .korean)
+    await translator.handle(.final("둘째 문장"), from: .korean)
+
+    let contexts = await spy.recordedContexts()
+    #expect(contexts.count == 2)
+    #expect(contexts[0].isEmpty, "첫 문장에는 앞선 문맥이 없어야 한다")
+    #expect(contexts[1] == ["원문: 첫 문장\n번역: [번역] 첫 문장 (보정됨)"],
+            "둘째 문장의 문맥에는 첫 문장의 '채택된'(보정된) 번역이 담겨야 한다")
+}
+
+@Test @MainActor func 문맥_창은_상한을_넘지_않는다() async {
+    let spy = ContextSpyRefiner()
+    let translator = Translator(table: .default, translate: fakeTranslate)
+    translator.refiner = spy
+
+    let total = Translator.contextWindowSize + 5
+    for i in 0..<total {
+        await translator.handle(.final("문장\(i)"), from: .korean)
+    }
+
+    let contexts = await spy.recordedContexts()
+    #expect(contexts.last?.count == Translator.contextWindowSize)
+    // 가장 오래된 문장은 창에서 밀려나 더는 보이지 않는다.
+    #expect(contexts.last?.contains { $0.contains("문장0\n") } == false)
+}
+
+@Test @MainActor func reset하면_문맥_창도_비워진다() async {
+    let spy = ContextSpyRefiner()
+    let translator = Translator(table: .default, translate: fakeTranslate)
+    translator.refiner = spy
+
+    await translator.handle(.final("문장"), from: .korean)
+    translator.reset() // refiner 프로퍼티는 그대로 두고 줄·문맥만 비운다
+    await translator.handle(.final("다음 문장"), from: .korean)
+
+    let contexts = await spy.recordedContexts()
+    #expect(contexts.last?.isEmpty == true)
+}
+
+@Test @MainActor func 문맥은_같은_원문_언어의_문장만_포함한다() async {
+    let spy = ContextSpyRefiner()
+    let translator = Translator(table: .default, translate: fakeTranslate)
+    translator.refiner = spy
+
+    await translator.handle(.final("한국어 문장"), from: .korean)
+    await translator.handle(.final("English sentence"), from: .english)
+    await translator.handle(.final("두 번째 한국어 문장"), from: .korean)
+
+    let contexts = await spy.recordedContexts()
+    #expect(contexts[2].count == 1, "영어 문장은 한국어 원문의 문맥에 섞이면 안 된다")
+    #expect(contexts[2][0].contains("한국어 문장"))
 }
 
 // MARK: - Step 5a: 응답 순서 회귀 테스트

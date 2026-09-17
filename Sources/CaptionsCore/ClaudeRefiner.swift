@@ -20,19 +20,8 @@ public struct ClaudeRefiner: TranslationRefiner {
     }
 
     public func refine(_ draft: String, source: String, context: [String]) async throws -> String {
-        let contextBlock = context.isEmpty ? "(없음)" : context.joined(separator: "\n")
-        let prompt = """
-        실시간 자막의 기계 번역을 다듬어라.
-
-        직전 문장들:
-        \(contextBlock)
-
-        원문: \(source)
-        기계 번역: \(draft)
-
-        자연스럽게 고친 번역문만 출력하라. 설명·따옴표·접두어를 붙이지 마라.
-        내용을 추가하거나 빼지 마라. 고칠 것이 없으면 기계 번역을 그대로 출력하라.
-        """
+        let prompt = RefinementPrompt.instruction + "\n\n"
+            + RefinementPrompt.content(draft: draft, source: source, context: context)
 
         var request = URLRequest(url: endpoint)
         request.httpMethod = "POST"

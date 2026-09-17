@@ -56,6 +56,38 @@ private actor RequestBox {
         #expect(json["thinking"] == nil)
     }
 
+    @Test func 프롬프트에_문맥_쌍이_순서대로_그대로_들어간다() async throws {
+        let body = try! JSONSerialization.data(withJSONObject: [
+            "stop_reason": "end_turn",
+            "content": [["type": "text", "text": "결과"]]
+        ])
+        let box = RequestBox()
+        let refiner = ClaudeRefiner(apiKey: "k", model: "claude-haiku-4-5") { request in
+            await box.store(request)
+            return (body, response(status: 200))
+        }
+        let pairs = [
+            "원문: 첫 문장\n번역: 첫 번역",
+            "원문: 둘째 문장\n번역: 둘째 번역"
+        ]
+        _ = try await refiner.refine("초안", source: "셋째 문장", context: pairs)
+
+        let request = try #require(await box.request)
+        let sent = try #require(request.httpBody)
+        let json = try #require(try JSONSerialization.jsonObject(with: sent) as? [String: Any])
+        let messages = try #require(json["messages"] as? [[String: Any]])
+        let prompt = try #require(messages.first?["content"] as? String)
+
+        #expect(json["output_config"] == nil)
+        #expect(json["thinking"] == nil)
+        // 두 문맥 쌍이 순서를 지키며 그대로 프롬프트에 실려야 한다 — 순서가 바뀌면
+        // 보정기가 용어를 엉뚱한 방향으로 "일관되게" 맞추게 된다.
+        let firstRange = try #require(prompt.range(of: pairs[0]))
+        let secondRange = try #require(prompt.range(of: pairs[1]))
+        #expect(firstRange.lowerBound < secondRange.lowerBound)
+        #expect(prompt.contains("일관되게"), "용어·톤 일관성 지시가 프롬프트에 있어야 한다")
+    }
+
     @Test func 텍스트가_아닌_블록은_건너뛴다() async throws {
         let body = try! JSONSerialization.data(withJSONObject: [
             "stop_reason": "end_turn",
