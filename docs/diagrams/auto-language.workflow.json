@@ -1,0 +1,220 @@
+{
+  "schema_version": 2,
+  "diagram_type": "workflow",
+  "meta": {
+    "title": "자동 언어 모드가 언어를 고르는 과정",
+    "quality_profile": "showcase",
+    "views": [
+      {
+        "id": "happy",
+        "label": "정상 경로",
+        "focus": [
+          "chunk",
+          "ko-run",
+          "ko-final",
+          "arb",
+          "winner",
+          "caption"
+        ],
+        "note": "두 언어를 동시에 듣고 신뢰도가 높은 쪽만 화면에 올린다."
+      },
+      {
+        "id": "copy",
+        "label": "버퍼 사본",
+        "focus": [
+          "chunk",
+          "ko-run",
+          "en-run"
+        ],
+        "note": "같은 버퍼를 두 분석기가 나눠 쓰면 레이스가 나므로 한쪽은 사본을 받는다."
+      },
+      {
+        "id": "grace",
+        "label": "승자가 없을 때",
+        "focus": [
+          "arb",
+          "caption"
+        ],
+        "note": "0.4초 안에 승자가 없으면 부분 결과라도 보여 화면이 비지 않게 한다."
+      }
+    ]
+  },
+  "lanes": [
+    {
+      "id": "audio",
+      "label": "오디오"
+    },
+    {
+      "id": "ko",
+      "label": "한국어 스택"
+    },
+    {
+      "id": "en",
+      "label": "영어 스택"
+    },
+    {
+      "id": "out",
+      "label": "중재 · 화면"
+    }
+  ],
+  "mainPath": [
+    "chunk",
+    "ko-run",
+    "ko-final",
+    "arb",
+    "winner",
+    "caption"
+  ],
+  "nodes": [
+    {
+      "id": "chunk",
+      "lane": "audio",
+      "col": 0,
+      "type": "external",
+      "label": "오디오 청크",
+      "sublabel": "실행 ID 도장",
+      "width": 170
+    },
+    {
+      "id": "ko-run",
+      "lane": "ko",
+      "col": 1,
+      "type": "backend",
+      "label": "한국어 분석기",
+      "sublabel": "원본 버퍼",
+      "width": 170
+    },
+    {
+      "id": "ko-final",
+      "lane": "ko",
+      "col": 2,
+      "type": "backend",
+      "label": "한국어 확정",
+      "sublabel": "문장 + 신뢰도",
+      "width": 170
+    },
+    {
+      "id": "en-run",
+      "lane": "en",
+      "col": 1,
+      "type": "backend",
+      "label": "영어 분석기",
+      "sublabel": "버퍼 사본",
+      "width": 170
+    },
+    {
+      "id": "en-final",
+      "lane": "en",
+      "col": 2,
+      "type": "backend",
+      "label": "영어 확정",
+      "sublabel": "문장 + 신뢰도",
+      "width": 170
+    },
+    {
+      "id": "arb",
+      "lane": "out",
+      "col": 3,
+      "type": "security",
+      "label": "중재",
+      "sublabel": "신뢰도 비교",
+      "tag": "발화 단위",
+      "width": 170
+    },
+    {
+      "id": "winner",
+      "lane": "out",
+      "col": 4,
+      "type": "backend",
+      "label": "승자 고정",
+      "sublabel": "진 쪽은 버림",
+      "width": 170
+    },
+    {
+      "id": "caption",
+      "lane": "out",
+      "col": 5,
+      "type": "frontend",
+      "label": "자막 줄",
+      "sublabel": "원문 + 번역",
+      "width": 170
+    }
+  ],
+  "edges": [
+    {
+      "id": "to-ko",
+      "from": "chunk",
+      "to": "ko-run",
+      "label": "그대로",
+      "variant": "default"
+    },
+    {
+      "id": "to-en",
+      "from": "chunk",
+      "to": "en-run",
+      "label": "메모리 사본",
+      "variant": "dashed"
+    },
+    {
+      "id": "ko-step",
+      "from": "ko-run",
+      "to": "ko-final",
+      "variant": "default"
+    },
+    {
+      "id": "en-step",
+      "from": "en-run",
+      "to": "en-final",
+      "variant": "default"
+    },
+    {
+      "id": "ko-vote",
+      "from": "ko-final",
+      "to": "arb",
+      "label": "후보",
+      "variant": "emphasis"
+    },
+    {
+      "id": "en-vote",
+      "from": "en-final",
+      "to": "arb",
+      "label": "후보",
+      "variant": "default"
+    },
+    {
+      "id": "pick",
+      "from": "arb",
+      "to": "winner",
+      "label": "높은 쪽",
+      "variant": "emphasis"
+    },
+    {
+      "id": "render",
+      "from": "winner",
+      "to": "caption",
+      "variant": "emphasis"
+    },
+    {
+      "id": "fallback",
+      "from": "arb",
+      "to": "caption",
+      "label": "동점이면 0.4초간 부분 결과",
+      "variant": "dashed",
+      "role": "branch",
+      "fromSide": "bottom",
+      "toSide": "bottom",
+      "route": "bottom-channel",
+      "labelSegment": 1
+    }
+  ],
+  "cards": [
+    {
+      "dot": "cyan",
+      "title": "왜 두 벌을 돌리나",
+      "items": [
+        "분석기 하나에 두 언어를 넣으면 프레임워크가 죽는다",
+        "승자가 정해지면 그 발화가 끝날 때까지 언어를 바꾸지 않는다"
+      ]
+    }
+  ]
+}

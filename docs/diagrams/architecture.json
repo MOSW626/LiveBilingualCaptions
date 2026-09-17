@@ -1,0 +1,363 @@
+{
+  "schema_version": 1,
+  "diagram_type": "architecture",
+  "meta": {
+    "title": "Live Bilingual Captions — 앱 구조",
+    "output": "architecture.html",
+    "quality_profile": "showcase",
+    "viewBox": [
+      1340,
+      660
+    ],
+    "views": [
+      {
+        "id": "main-path",
+        "label": "주 경로",
+        "focus": [
+          "mic",
+          "converter",
+          "pipeKo",
+          "arbitrator",
+          "captions",
+          "overlay"
+        ],
+        "note": "마이크 소리가 화면의 자막 한 줄이 되기까지."
+      },
+      {
+        "id": "auto-language",
+        "label": "자동 언어",
+        "focus": [
+          "converter",
+          "pipeKo",
+          "pipeEn",
+          "arbitrator"
+        ],
+        "note": "인식 스택 두 벌과 중재기 — 소리를 듣고 언어를 고르는 부분."
+      },
+      {
+        "id": "translation",
+        "label": "번역",
+        "focus": [
+          "captions",
+          "translator",
+          "refiner",
+          "keychain"
+        ],
+        "note": "온디바이스 번역이 기본, 보정은 선택."
+      }
+    ]
+  },
+  "components": [
+    {
+      "id": "mic",
+      "type": "external",
+      "label": "마이크",
+      "sublabel": "AVAudioEngine",
+      "tag": "마이크 권한",
+      "pos": [
+        40,
+        200
+      ],
+      "size": [
+        140,
+        64
+      ]
+    },
+    {
+      "id": "sysaudio",
+      "type": "external",
+      "label": "시스템 오디오",
+      "sublabel": "ScreenCaptureKit",
+      "tag": "화면 기록 권한",
+      "pos": [
+        40,
+        310
+      ],
+      "size": [
+        140,
+        64
+      ]
+    },
+    {
+      "id": "converter",
+      "type": "backend",
+      "label": "오디오 변환",
+      "sublabel": "48k → 16k Int16",
+      "pos": [
+        248,
+        245
+      ],
+      "size": [
+        155,
+        68
+      ]
+    },
+    {
+      "id": "controller",
+      "type": "backend",
+      "label": "PipelineController",
+      "sublabel": "제어 경로 단일화",
+      "pos": [
+        248,
+        440
+      ],
+      "size": [
+        155,
+        68
+      ]
+    },
+    {
+      "id": "pipeKo",
+      "type": "backend",
+      "label": "한국어 인식",
+      "sublabel": "SpeechAnalyzer",
+      "pos": [
+        471,
+        100
+      ],
+      "size": [
+        165,
+        70
+      ]
+    },
+    {
+      "id": "pipeEn",
+      "type": "backend",
+      "label": "영어 인식",
+      "sublabel": "SpeechAnalyzer",
+      "pos": [
+        471,
+        400
+      ],
+      "size": [
+        165,
+        70
+      ]
+    },
+    {
+      "id": "arbitrator",
+      "type": "backend",
+      "label": "중재기",
+      "sublabel": "신뢰도로 언어 채택",
+      "pos": [
+        704,
+        245
+      ],
+      "size": [
+        165,
+        70
+      ]
+    },
+    {
+      "id": "captions",
+      "type": "database",
+      "label": "자막 상태",
+      "sublabel": "최근 발화 줄 목록",
+      "tag": "실행 ID + 발화 ID",
+      "pos": [
+        937,
+        130
+      ],
+      "size": [
+        165,
+        70
+      ]
+    },
+    {
+      "id": "translator",
+      "type": "backend",
+      "label": "번역",
+      "sublabel": "Apple 온디바이스",
+      "pos": [
+        937,
+        380
+      ],
+      "size": [
+        165,
+        70
+      ]
+    },
+    {
+      "id": "overlay",
+      "type": "frontend",
+      "label": "자막 오버레이",
+      "sublabel": "SwiftUI in NSPanel",
+      "pos": [
+        1170,
+        130
+      ],
+      "size": [
+        145,
+        70
+      ]
+    },
+    {
+      "id": "refiner",
+      "type": "external",
+      "label": "보정기",
+      "sublabel": "Claude / OpenAI",
+      "tag": "선택 · 기본 꺼짐",
+      "pos": [
+        1170,
+        380
+      ],
+      "size": [
+        145,
+        70
+      ]
+    },
+    {
+      "id": "keychain",
+      "type": "security",
+      "label": "Keychain",
+      "sublabel": "API 키 보관",
+      "pos": [
+        1170,
+        510
+      ],
+      "size": [
+        145,
+        60
+      ]
+    }
+  ],
+  "boundaries": [
+    {
+      "kind": "region",
+      "label": "CaptionsCore — UI 없는 라이브러리 (테스트 204개)",
+      "wraps": [
+        "converter",
+        "controller",
+        "pipeKo",
+        "pipeEn",
+        "arbitrator",
+        "captions",
+        "translator"
+      ]
+    }
+  ],
+  "connections": [
+    {
+      "id": "mic-audio",
+      "from": "mic",
+      "to": "converter",
+      "label": "오디오 버퍼",
+      "labelDy": -46
+    },
+    {
+      "id": "sys-audio",
+      "from": "sysaudio",
+      "to": "converter",
+      "label": "오디오 버퍼",
+      "labelDy": 46
+    },
+    {
+      "id": "control-run",
+      "from": "controller",
+      "to": "converter",
+      "label": "시작 · 정지 · 재구성",
+      "variant": "dashed"
+    },
+    {
+      "id": "to-ko",
+      "from": "converter",
+      "to": "pipeKo",
+      "label": "16kHz Int16",
+      "labelDy": -46
+    },
+    {
+      "id": "to-en",
+      "from": "converter",
+      "to": "pipeEn",
+      "label": "오디오 사본",
+      "variant": "dashed",
+      "labelDy": 46
+    },
+    {
+      "id": "ko-result",
+      "from": "pipeKo",
+      "to": "arbitrator",
+      "label": "전사 + 신뢰도",
+      "labelAt": [
+        670,
+        190
+      ]
+    },
+    {
+      "id": "en-result",
+      "from": "pipeEn",
+      "to": "arbitrator",
+      "label": "전사 + 신뢰도",
+      "labelDy": 46
+    },
+    {
+      "id": "adopted",
+      "from": "arbitrator",
+      "to": "captions",
+      "label": "채택된 발화",
+      "variant": "emphasis",
+      "labelDy": -46
+    },
+    {
+      "id": "rows",
+      "from": "captions",
+      "to": "overlay",
+      "label": "최근 줄 목록",
+      "labelDy": -46
+    },
+    {
+      "id": "submit",
+      "from": "captions",
+      "to": "translator",
+      "label": "원문 ↔ 번역문",
+      "labelAt": [
+        1020,
+        290
+      ]
+    },
+    {
+      "id": "refine",
+      "from": "translator",
+      "to": "refiner",
+      "label": "확정 문장 + 문맥",
+      "variant": "dashed",
+      "labelDy": -46
+    },
+    {
+      "id": "api-key",
+      "from": "keychain",
+      "to": "refiner",
+      "label": "API 키",
+      "variant": "security"
+    }
+  ],
+  "cards": [
+    {
+      "dot": "cyan",
+      "title": "입력",
+      "items": [
+        "마이크는 AVAudioEngine, 시스템 오디오는 ScreenCaptureKit",
+        "분석기가 리샘플링하지 않아 16kHz Int16으로 바꿔 넣는다",
+        "탭 콜백은 오디오 실시간 스레드 — 여기서 격리를 물려받아 앱이 죽은 적이 있다"
+      ]
+    },
+    {
+      "dot": "emerald",
+      "title": "인식",
+      "items": [
+        "자동 모드는 한국어·영어 스택을 동시에 돌린다",
+        "한 분석기에 전사기 둘을 물리면 SIGTRAP — 그래서 두 벌",
+        "확정 문장의 반복 용어를 뽑아 인식기에 문맥 힌트로 되먹인다"
+      ]
+    },
+    {
+      "dot": "violet",
+      "title": "자막 · 번역",
+      "items": [
+        "문장 단위로 끊어 줄을 쌓고, 침묵 뒤에만 지운다",
+        "줄은 (실행 ID, 발화 ID)로 식별 — 늦게 온 번역도 제 줄에 붙는다",
+        "번역은 Apple 온디바이스가 기본, LLM 보정은 선택이고 기본 꺼짐"
+      ]
+    }
+  ]
+}

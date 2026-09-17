@@ -1,0 +1,222 @@
+{
+  "schema_version": 1,
+  "diagram_type": "dataflow",
+  "meta": {
+    "title": "소리 한 조각이 자막 한 줄이 되기까지",
+    "output": "dataflow.html",
+    "viewBox": [
+      1080,
+      545
+    ],
+    "quality_profile": "showcase",
+    "views": [
+      {
+        "id": "hot-path",
+        "label": "주 경로",
+        "focus": [
+          "tap",
+          "ko",
+          "arb",
+          "screen"
+        ],
+        "note": "버퍼 하나가 화면에 닿기까지 거치는 최소 경로."
+      },
+      {
+        "id": "dual",
+        "label": "두 벌 인식",
+        "focus": [
+          "ko",
+          "en",
+          "arb"
+        ],
+        "note": "같은 오디오를 두 인식기에 흘려보내고 하나만 채택한다."
+      },
+      {
+        "id": "render",
+        "label": "화면",
+        "focus": [
+          "row",
+          "trans",
+          "screen",
+          "arb"
+        ],
+        "note": "문장으로 끊어 줄을 만들고 원문과 번역을 같이 그린다."
+      }
+    ]
+  },
+  "stages": [
+    {
+      "label": "캡처"
+    },
+    {
+      "label": "인식"
+    },
+    {
+      "label": "판정"
+    },
+    {
+      "label": "정리"
+    },
+    {
+      "label": "표시"
+    }
+  ],
+  "nodes": [
+    {
+      "id": "tap",
+      "type": "external",
+      "label": "오디오 탭 + 변환",
+      "sublabel": "16kHz Int16로 변환",
+      "stage": 0,
+      "row": 1,
+      "tag": "버퍼 즉시 복사"
+    },
+    {
+      "id": "ko",
+      "type": "backend",
+      "label": "한국어 전사",
+      "sublabel": "부분 → 확정",
+      "stage": 1,
+      "row": 0,
+      "tag": "신뢰도 포함"
+    },
+    {
+      "id": "en",
+      "type": "backend",
+      "label": "영어 전사",
+      "sublabel": "부분 → 확정",
+      "stage": 1,
+      "row": 2,
+      "tag": "신뢰도 포함"
+    },
+    {
+      "id": "arb",
+      "type": "backend",
+      "label": "중재 + 문장 분할",
+      "sublabel": "채택 → 묶기 → 쪼개기",
+      "stage": 2,
+      "row": 1,
+      "tag": "한쪽만 채택"
+    },
+    {
+      "id": "row",
+      "type": "database",
+      "label": "자막 줄",
+      "sublabel": "실행 ID + 발화 ID",
+      "stage": 3,
+      "row": 0,
+      "tag": "침묵 뒤 비움"
+    },
+    {
+      "id": "trans",
+      "type": "backend",
+      "label": "번역",
+      "sublabel": "Apple 온디바이스",
+      "stage": 3,
+      "row": 2,
+      "tag": "오프라인 동작"
+    },
+    {
+      "id": "screen",
+      "type": "frontend",
+      "label": "화면",
+      "sublabel": "최근 줄 목록",
+      "stage": 4,
+      "row": 1,
+      "tag": "원문 + 번역"
+    }
+  ],
+  "flows": [
+    {
+      "id": "to-ko",
+      "from": "tap",
+      "to": "ko",
+      "label": "16kHz Int16",
+      "classification": "분석기 요구 포맷"
+    },
+    {
+      "id": "to-en",
+      "from": "tap",
+      "to": "en",
+      "label": "메모리 사본",
+      "classification": "공유하면 레이스",
+      "variant": "dashed"
+    },
+    {
+      "id": "ko-out",
+      "from": "ko",
+      "to": "arb",
+      "label": "확정 + 신뢰도",
+      "classification": "언어 후보"
+    },
+    {
+      "id": "en-out",
+      "from": "en",
+      "to": "arb",
+      "label": "확정 + 신뢰도",
+      "classification": "언어 후보"
+    },
+    {
+      "id": "to-row",
+      "from": "arb",
+      "to": "row",
+      "label": "문장 한 줄씩",
+      "classification": "진 쪽은 버림",
+      "variant": "emphasis"
+    },
+    {
+      "id": "to-trans",
+      "from": "row",
+      "to": "trans",
+      "label": "줄의 원문",
+      "classification": "확정 문장",
+      "labelAt": [
+        807,
+        200
+      ]
+    },
+    {
+      "id": "src-out",
+      "from": "row",
+      "to": "screen",
+      "label": "원문",
+      "classification": "윗줄"
+    },
+    {
+      "id": "dst-out",
+      "from": "trans",
+      "to": "screen",
+      "label": "번역문",
+      "classification": "아랫줄"
+    }
+  ],
+  "cards": [
+    {
+      "dot": "cyan",
+      "title": "빌린 버퍼는 콜백 안에서 끝난다",
+      "items": [
+        "오디오 탭이 주는 버퍼는 콜백이 끝나면 OS가 재사용한다",
+        "그래서 콜백 안에서 변환해 소유한 버퍼로 바꾼다",
+        "두 번째 인식기에는 같은 인스턴스가 아니라 memcpy 사본을 준다"
+      ]
+    },
+    {
+      "dot": "emerald",
+      "title": "언어는 소리로 고른다",
+      "items": [
+        "글자를 세서 언어를 고르면 잘못 인식된 글자에 끌려간다",
+        "두 인식기의 신뢰도를 비교해 발화마다 한쪽을 채택한다",
+        "한쪽이 조용하면 0.4초 뒤 먼저 온 쪽을 쓴다 — 화면이 비지 않게"
+      ]
+    },
+    {
+      "dot": "violet",
+      "title": "줄은 사라지지 않는다",
+      "items": [
+        "문장 단위로 끊어 최근 발화를 쌓는다",
+        "지우는 건 침묵이 이어진 뒤뿐이다",
+        "늦게 도착한 번역도 (실행 ID, 발화 ID)로 제 줄을 찾아간다"
+      ]
+    }
+  ]
+}
