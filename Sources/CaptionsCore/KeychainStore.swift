@@ -4,6 +4,7 @@ import Security
 /// API 키 보관소. UserDefaults·소스코드·환경변수에 키를 두지 않는다.
 public enum KeychainStore {
     public static let apiKeyAccount = "anthropic.api-key"
+    public static let openAIKeyAccount = "openai.api-key"
     private static let service = "local.codex.LiveBilingualCaptions"
 
     private static func query(_ account: String) -> [String: Any] {

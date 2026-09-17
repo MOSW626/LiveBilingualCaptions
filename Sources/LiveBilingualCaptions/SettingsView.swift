@@ -12,7 +12,7 @@ struct SettingsView: View {
     /// 토글을 켠 뒤 처음 키를 저장하는 순간에도(재토글·재실행 없이) 반영되려면 필요하다.
     var onAPIKeySaved: () -> Void
 
-    @State private var apiKey = KeychainStore.read(account: KeychainStore.apiKeyAccount) ?? ""
+    @State private var apiKey = ""
     @State private var keySaveStatus = ""
 
     var body: some View {
@@ -76,24 +76,52 @@ struct SettingsView: View {
                 }
             }
             Section("번역 보정") {
-                Toggle("Claude 로 확정 문장 다듬기", isOn: $settings.refinementEnabled)
-                Text("켜면 확정된 문장만 인터넷으로 전송됩니다. 끄면 모든 처리가 기기 안에서 끝납니다.")
+                Toggle("LLM 으로 확정 문장 다듬기", isOn: $settings.refinementEnabled)
+                Text("켜면 확정된 문장과 직전 대화 맥락이 선택한 제공자(아래 피커) 서버로 전송되어 번역을 다듬습니다. 그 아래 칸에 해당 제공자의 API 키를 입력하세요. 끄면 모든 처리가 기기 안에서 끝납니다.")
                     .font(.caption).foregroundStyle(.secondary)
                 if settings.refinementEnabled {
-                    SecureField("Anthropic API 키", text: $apiKey)
+                    Picker("보정 제공자", selection: $settings.refinementProvider) {
+                        ForEach(RefinementProvider.allCases, id: \.self) { provider in
+                            Text(provider.displayName).tag(provider)
+                        }
+                    }
+                    .onChange(of: settings.refinementProvider) { _, _ in loadStoredKey() }
+                    SecureField(apiKeyFieldLabel, text: $apiKey)
                         .onSubmit { saveAPIKey() }
                     Button("키 저장", action: saveAPIKey)
+                    if settings.refinementProvider == .openai {
+                        TextField("OpenAI 모델", text: $settings.openAIModel)
+                        Text("요청이 거부되면(모델을 찾을 수 없음 등) 여기 모델 이름을 바꿔보세요.")
+                            .font(.caption).foregroundStyle(.secondary)
+                    }
                     if !keySaveStatus.isEmpty {
                         Text(keySaveStatus)
                             .font(.caption).foregroundStyle(.secondary)
+                    } else if apiKey.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                        Text("\(apiKeyFieldLabel)가 없어 보정이 동작하지 않습니다")
+                            .font(.caption).foregroundStyle(.secondary)
                     }
-                    Text("키는 Keychain 에 저장됩니다.")
+                    Text("키는 Keychain 에 제공자별로 따로 저장됩니다.")
                         .font(.caption).foregroundStyle(.secondary)
                 }
             }
         }
         .formStyle(.grouped)
         .frame(width: 420)
+        .onAppear { loadStoredKey() }
+    }
+
+    private var keychainAccount: String {
+        settings.refinementProvider == .claude ? KeychainStore.apiKeyAccount : KeychainStore.openAIKeyAccount
+    }
+
+    private var apiKeyFieldLabel: String {
+        settings.refinementProvider == .claude ? "Anthropic API 키" : "OpenAI API 키"
+    }
+
+    private func loadStoredKey() {
+        apiKey = KeychainStore.read(account: keychainAccount) ?? ""
+        keySaveStatus = ""
     }
 
     private func saveAPIKey() {
@@ -102,7 +130,7 @@ struct SettingsView: View {
             keySaveStatus = "API 키를 입력하세요"
             return
         }
-        guard KeychainStore.save(value, account: KeychainStore.apiKeyAccount) else {
+        guard KeychainStore.save(value, account: keychainAccount) else {
             keySaveStatus = "키를 저장하지 못했습니다"
             return
         }

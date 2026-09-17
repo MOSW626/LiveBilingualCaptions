@@ -28,6 +28,17 @@ public enum DetectorSensitivity: String, Codable, Sendable, CaseIterable {
     }
 }
 
+public enum RefinementProvider: String, Codable, Sendable, CaseIterable {
+    case claude, openai
+
+    public var displayName: String {
+        switch self {
+        case .claude: "Claude"
+        case .openai: "OpenAI"
+        }
+    }
+}
+
 public struct Settings: Codable, Equatable, Sendable {
     public var languageMode: LanguageMode
     public var preferredTargetID: String?
@@ -36,6 +47,10 @@ public struct Settings: Codable, Equatable, Sendable {
     public var captionHoldSeconds: Double
     public var detectorSensitivity: DetectorSensitivity
     public var refinementEnabled: Bool
+    /// 보정을 어느 제공자에게 맡길지. 제공자마다 Keychain 계정이 따로 있다.
+    public var refinementProvider: RefinementProvider
+    /// OpenAI 보정에 쓸 모델 이름. 검증된 고정 ID가 없어 사용자가 직접 바꿀 수 있게 둔다.
+    public var openAIModel: String
     /// 화면에 남겨둘 최근 발화 개수. 말이 끊이지 않는 화자에게 읽을 시간을 준다.
     public var captionHistoryCount: Int
     public var panelOriginX: Double?
@@ -45,6 +60,7 @@ public struct Settings: Codable, Equatable, Sendable {
     public static let storageKey = "settings.v1"
     public static let defaultCaptionHistoryCount = 3
     public static let captionHistoryCountRange = 1...10
+    public static let defaultOpenAIModel = OpenAIRefiner.defaultModel
 
     public static let `default` = Settings(
         languageMode: .auto,
@@ -54,6 +70,8 @@ public struct Settings: Codable, Equatable, Sendable {
         captionHoldSeconds: 10,
         detectorSensitivity: .medium,
         refinementEnabled: false,      // 네트워크·비용이 드는 기능은 기본 꺼짐
+        refinementProvider: .claude,
+        openAIModel: defaultOpenAIModel,
         captionHistoryCount: defaultCaptionHistoryCount,
         panelOriginX: nil,
         panelOriginY: nil,
@@ -67,6 +85,8 @@ public struct Settings: Codable, Equatable, Sendable {
         captionHoldSeconds: Double,
         detectorSensitivity: DetectorSensitivity,
         refinementEnabled: Bool,
+        refinementProvider: RefinementProvider,
+        openAIModel: String,
         captionHistoryCount: Int,
         panelOriginX: Double?,
         panelOriginY: Double?,
@@ -79,6 +99,8 @@ public struct Settings: Codable, Equatable, Sendable {
         self.captionHoldSeconds = captionHoldSeconds
         self.detectorSensitivity = detectorSensitivity
         self.refinementEnabled = refinementEnabled
+        self.refinementProvider = refinementProvider
+        self.openAIModel = openAIModel
         self.captionHistoryCount = captionHistoryCount
         self.panelOriginX = panelOriginX
         self.panelOriginY = panelOriginY
@@ -87,8 +109,8 @@ public struct Settings: Codable, Equatable, Sendable {
 
     private enum CodingKeys: String, CodingKey {
         case languageMode, preferredTargetID, audioSource, fontSize, captionHoldSeconds
-        case detectorSensitivity, refinementEnabled, captionHistoryCount
-        case panelOriginX, panelOriginY, panelWidth
+        case detectorSensitivity, refinementEnabled, refinementProvider, openAIModel
+        case captionHistoryCount, panelOriginX, panelOriginY, panelWidth
     }
 
     /// `captionHistoryCount`는 옛 저장값엔 없을 수 있는 non-optional 필드다 — 없으면
@@ -103,6 +125,10 @@ public struct Settings: Codable, Equatable, Sendable {
         captionHoldSeconds = try container.decode(Double.self, forKey: .captionHoldSeconds)
         detectorSensitivity = try container.decode(DetectorSensitivity.self, forKey: .detectorSensitivity)
         refinementEnabled = try container.decode(Bool.self, forKey: .refinementEnabled)
+        refinementProvider = try container.decodeIfPresent(RefinementProvider.self, forKey: .refinementProvider)
+            ?? .claude
+        openAIModel = try container.decodeIfPresent(String.self, forKey: .openAIModel)
+            ?? Settings.defaultOpenAIModel
         let storedCount = try container.decodeIfPresent(Int.self, forKey: .captionHistoryCount)
             ?? Settings.defaultCaptionHistoryCount
         let range = Settings.captionHistoryCountRange

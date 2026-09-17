@@ -17,6 +17,8 @@ private func freshDefaults(_ name: String) -> UserDefaults {
     settings.captionHoldSeconds = 4.5
     settings.detectorSensitivity = .high
     settings.refinementEnabled = true
+    settings.refinementProvider = .openai
+    settings.openAIModel = "gpt-4.1-mini"
     settings.captionHistoryCount = 5
     settings.panelOriginX = 120
     settings.panelOriginY = 64
@@ -51,12 +53,19 @@ private func freshDefaults(_ name: String) -> UserDefaults {
     #expect(Settings.default.refinementEnabled == false)
 }
 
+@Test func 기본_제공자는_Claude이고_OpenAI_모델은_기본값을_쓴다() {
+    #expect(Settings.default.refinementProvider == .claude)
+    #expect(Settings.default.openAIModel == Settings.defaultOpenAIModel)
+}
+
 @Test func 새_optional_필드가_없는_옛_JSON도_기존_값을_보존하며_읽힌다() {
     let defaults = freshDefaults("test.legacy")
     // preferredTargetID, panelWidth 뿐 아니라 captionHistoryCount(non-optional로 나중에
     // 추가된 필드)도 없는 구버전 JSON을 손으로 만든다. 새 필드 하나가 옛 설정을 통째로
     // 날려서는 안 된다. panelHeight는 반대로, 더 이상 쓰지 않는 필드가 남아 있는 옛
     // JSON — CodingKeys에서 빠졌다고 디코드가 깨지면 안 된다.
+    // refinementProvider·openAIModel도 이 JSON엔 없다 — OpenAI 지원을 나중에 추가했으니,
+    // 옛 설정을 읽는 사용자는 항상 이 필드들이 없는 상태에서 시작한다.
     let legacyJSON = """
     {
         "languageMode": { "fixed": { "_0": "ja-JP" } },
@@ -80,4 +89,6 @@ private func freshDefaults(_ name: String) -> UserDefaults {
     #expect(loaded.preferredTargetID == nil)
     #expect(loaded.panelWidth == nil)
     #expect(loaded.captionHistoryCount == Settings.defaultCaptionHistoryCount)
+    #expect(loaded.refinementProvider == .claude)
+    #expect(loaded.openAIModel == Settings.defaultOpenAIModel)
 }

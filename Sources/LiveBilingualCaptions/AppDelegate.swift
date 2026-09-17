@@ -96,11 +96,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         state.fontSize = settings.fontSize
         state.historyCount = settings.captionHistoryCount
         state.audioSourceName = settings.audioSource.displayName
-        state.segmentCap = CaptionSegmenter.recommendedCap(
-            panelWidth: settings.panelWidth ?? PanelFrame.defaultWidth, fontSize: settings.fontSize)
+        updateSegmentCaps(panelWidth: settings.panelWidth ?? PanelFrame.defaultWidth, fontSize: settings.fontSize)
         translator.preferredTargetID = settings.preferredTargetID
         currentLanguage = resolveCurrentLanguage(for: settings.languageMode) // didSet이 syncLanguage()를 부른다
         refreshLanguagePairAvailability()
+    }
+
+    /// 패널 폭·글자 크기가 바뀔 때만 부른다(§ 일반 원칙: 실시간 스레드는 물론
+    /// 문장마다도 CTLine을 다시 재지 않는다). 언어별로 안전망 상한을 다시 재서
+    /// `CaptionState.segmentCapsByLanguage`를 채운다 — 자동 모드는 화면에 한국어·영어
+    /// 줄이 섞여 있을 수 있어서 상한 하나로는 부족하다(버그 수정: 코드 리뷰).
+    private func updateSegmentCaps(panelWidth: Double, fontSize: Double) {
+        state.segmentCapsByLanguage = Dictionary(uniqueKeysWithValues: LanguageTable.default.languages.map { language in
+            (language.id, CaptionSegmenter.recommendedCap(panelWidth: panelWidth, fontSize: fontSize, language: language))
+        })
     }
 
     /// languageMode 에서 파생되는 인식 언어. 자동 모드의 시작(추정) 언어는 항상 한국어다 —
@@ -210,12 +219,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         // 안전망 상한은 폭·글자 크기가 실제로 바뀔 때만 다시 잰다(§ 일반 원칙: 실시간
         // 스레드는 물론 문장마다도 재계산하지 않는다) — CTLine 실측 비용을 여기서만 쓴다.
         if old.panelWidth != new.panelWidth || old.fontSize != new.fontSize {
-            state.segmentCap = CaptionSegmenter.recommendedCap(
-                panelWidth: new.panelWidth ?? PanelFrame.defaultWidth, fontSize: new.fontSize)
+            updateSegmentCaps(panelWidth: new.panelWidth ?? PanelFrame.defaultWidth, fontSize: new.fontSize)
         }
         translator.preferredTargetID = new.preferredTargetID
         syncLanguage() // preferredTargetID만 바뀌어도 대상 언어가 달라질 수 있다
-        if old.refinementEnabled != new.refinementEnabled { updateRefiner() }
+        if old.refinementEnabled != new.refinementEnabled
+            || old.refinementProvider != new.refinementProvider { updateRefiner() }
 
         let result = applySettingsChange(old: old, new: new, running: running,
                                          configuration: currentConfiguration, controller: controller)
@@ -253,16 +262,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         return result.didReconfigure
     }
 
-    /// 보정 토글·키 저장 성공 시에만 부른다. 폰트 크기 같은 무관한 변경에는 부르지 않는다 —
-    /// `Translator.refiner`의 didSet이 진행 중인 보정 작업을 매번 취소하기 때문이다.
+    /// 보정 토글·제공자 전환·키 저장 성공 시에만 부른다. 폰트 크기 같은 무관한 변경에는
+    /// 부르지 않는다 — `Translator.refiner`의 didSet이 진행 중인 보정 작업을 매번
+    /// 취소하기 때문이다. 실제 선택(제공자별 키가 있는지, 없으면 nil)은
+    /// `RefinerFactory`(CaptionsCore)가 순수 함수로 한다 — AppKit 없이 테스트하려고.
     private func updateRefiner() {
-        guard settingsStore.value.refinementEnabled,
-              let key = KeychainStore.read(account: KeychainStore.apiKeyAccount),
-              !key.isEmpty else {
-            translator.refiner = nil
-            return
-        }
-        translator.refiner = ClaudeRefiner(apiKey: key, model: refinerModel)
+        translator.refiner = RefinerFactory.makeRefiner(
+            settings: settingsStore.value,
+            anthropicKey: KeychainStore.read(account: KeychainStore.apiKeyAccount),
+            openAIKey: KeychainStore.read(account: KeychainStore.openAIKeyAccount),
+            anthropicModel: refinerModel)
     }
 
     /// 음성 locale 지원 여부와 번역의 방향별 상태를 조회해 설정 창의 비활성/다운로드 안내를
