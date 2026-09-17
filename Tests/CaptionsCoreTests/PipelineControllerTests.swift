@@ -1290,14 +1290,14 @@ let autoConfig = PipelineConfiguration(source: .microphone, language: .korean, s
     let en = harness.engine.sessions.wrapped[1]
 
     // 아직 아무 발화도 확정되지 않았다 — 화면이 비지 않도록 둘 다 보여야 한다.
+    // 두 언어는 서로 다른 세션 스트림에서 독립된 태스크로 중재자에 들어온다 —
+    // 도착 "순서"는 둘 다 왔는지와 달리 보장되지 않는다(가끔 en이 ko보다 먼저
+    // 중재자에 닿는다). 그래서 개수로 기다리고, 집합으로 비교한다.
     ko.emit("듣는 중", isFinal: false, start: 0, end: 0.5)
     en.emit("listening", isFinal: false, start: 0, end: 0.5)
-    await harness.waitForEvent {
-        if case .transcript(let e) = $0.kind { return e.text == "listening" }
-        return false
-    }
+    await harness.waitForEvent { _ in harness.transcripts.count >= 2 }
 
-    #expect(harness.transcripts.map(\.text) == ["듣는 중", "listening"])
+    #expect(Set(harness.transcripts.map(\.text)) == ["듣는 중", "listening"])
 }
 
 @Test @MainActor func 승자가_정해진_뒤에는_진_쪽의_다음_partial이_버려진다() async {

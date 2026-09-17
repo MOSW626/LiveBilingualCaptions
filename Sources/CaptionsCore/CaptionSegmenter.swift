@@ -96,10 +96,16 @@ public enum CaptionSegmenter {
     ///
     /// **실시간 오디오 스레드에서 부르지 않는다.** `CTLine` 생성은 문장/청크마다 부를
     /// 비용이 아니다 — 호출자(`AppDelegate`)가 패널 폭이나 글자 크기가 실제로 바뀔
-    /// 때만 불러 결과를 캐싱해야 한다(`CaptionState.segmentCap`).
-    public static func recommendedCap(panelWidth: CGFloat, fontSize: CGFloat) -> Int {
+    /// 때 언어별로(`CaptionState.segmentCapsByLanguage`) 캐싱해야 한다. 자막 줄의
+    /// 실제 상한은 그 줄이 찍힌 발화의 언어(`TranscriptEvent.sourceLanguage`)로 고른다
+    /// — 자동 모드는 화면에 두 언어 줄이 섞여 있을 수 있어서 상한 하나로는 부족하다
+    /// (버그 수정: 코드 리뷰, "영어 줄이 너무 일찍 끊긴다").
+    ///
+    /// `language` 기본값은 `.korean`이다 — 이전 호출부(언어를 몰랐던 시절)와 값이
+    /// 그대로 재현된다.
+    public static func recommendedCap(panelWidth: CGFloat, fontSize: CGFloat, language: CaptionLanguage = .korean) -> Int {
         let contentWidth = max(panelWidth - horizontalPadding, 1)
-        let glyphWidth = max(representativeHangulGlyphWidth(fontSize: fontSize), 1)
+        let glyphWidth = max(representativeGlyphWidth(fontSize: fontSize, language: language), 1)
         let charsPerLine = max(Int((contentWidth / glyphWidth).rounded(.down)), 1)
         let cap = charsPerLine * linesAllowed
         return min(max(cap, capFloor), capCeiling)
@@ -116,19 +122,34 @@ public enum CaptionSegmenter {
     /// 넓히거나 글자를 아무리 줄여도 한 줄이 과하게 길어지지 않게 잡아 둔다.
     public static let capCeiling = 240
 
-    /// `CaptionOverlay`가 원문에 쓰는 것과 같은 굵기(semibold)의 한글 대체 폰트
-    /// (Apple SD Gothic Neo — SwiftUI `.system` 폰트가 한글에서 실제로 대체하는 폰트)로
-    /// 대표 표본 문자열 하나를 그어 평균 글자 폭을 얻는다.
-    private static func representativeHangulGlyphWidth(fontSize: CGFloat) -> CGFloat {
-        let font = CTFontCreateWithName("AppleSDGothicNeo-SemiBold" as CFString, fontSize, nil)
-        let sample = "안녕하세요오늘회의를시작하겠습니다첫번째안건은" as CFString
+    /// `CaptionOverlay`가 원문에 쓰는 것과 같은 굵기(semibold)의 대표 표본 문자열
+    /// 하나를 그어 평균 글자 폭을 얻는다. 언어마다 다른 폰트·표본을 쓴다 — 로마자
+    /// 글자는 한글 완성형 음절보다 훨씬 좁아서(버그 수정: 코드 리뷰) 같은 안전망을
+    /// 그대로 쓰면 영문 자막이 실제로 들어갈 수 있는 것보다 훨씬 일찍 끊긴다.
+    /// 한국어는 Apple SD Gothic Neo(SwiftUI `.system` 폰트가 한글에서 실제로 대체하는
+    /// 폰트)를, 그 외(지금 테이블엔 영어뿐이다)는 시스템 폰트 자체를 쓴다.
+    private static func representativeGlyphWidth(fontSize: CGFloat, language: CaptionLanguage) -> CGFloat {
+        let fontName: String
+        let sample: String
+        if language == .korean {
+            fontName = "AppleSDGothicNeo-SemiBold"
+            sample = "안녕하세요오늘회의를시작하겠습니다첫번째안건은"
+        } else {
+            // ".AppleSystemUIFontSemibold"는 AppKit이 systemFont(ofSize:weight: .semibold)에
+            // 내부적으로 쓰는 이름이다 — 한글 쪽 대체 폰트 이름과 같은 급의, 안정적이지만
+            // 비공식인 이름이다. 표본은 로마자 평균 폭을 대표하도록 공백을 섞은 흔한 단어들.
+            fontName = ".AppleSystemUIFontSemibold"
+            sample = "the quick brown fox jumps over the lazy dog today and tomorrow"
+        }
+        let font = CTFontCreateWithName(fontName as CFString, fontSize, nil)
+        let cfSample = sample as CFString
         let attributes = [kCTFontAttributeName: font] as CFDictionary
-        guard let attributed = CFAttributedStringCreate(nil, sample, attributes) else {
+        guard let attributed = CFAttributedStringCreate(nil, cfSample, attributes) else {
             return fontSize // 극단적 실패 시에도 0으로 나누지 않을 안전한 대체값.
         }
         let line = CTLineCreateWithAttributedString(attributed)
         let width = CTLineGetTypographicBounds(line, nil, nil, nil)
-        return CGFloat(width) / CGFloat(CFStringGetLength(sample))
+        return CGFloat(width) / CGFloat(CFStringGetLength(cfSample))
     }
 
     private static func skipWhitespace(_ chars: [Character], from index: Int) -> Int {

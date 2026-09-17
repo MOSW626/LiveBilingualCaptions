@@ -125,3 +125,13 @@ import Testing
     let cap = CaptionSegmenter.recommendedCap(panelWidth: PanelFrame.defaultWidth, fontSize: 20)
     #expect((30...80).contains(cap))
 }
+
+// 버그 회귀(코드 리뷰): 로마자 글자는 한글 완성형 음절보다 평균 폭이 훨씬 좁다.
+// 상한이 언어를 몰랐을 때는 늘 한글 표본으로만 쟀는데, 그 상한을 영문에 그대로
+// 쓰면 실제 들어갈 수 있는 글자 수의 절반 즈음에서 줄이 끊긴다("영어 줄이 너무
+// 일찍 끊긴다"). 같은 폭·글자 크기에서 영문 상한이 한글 상한보다 뚜렷이 커야 한다.
+@Test func 같은_폭_같은_글자_크기에서_영문_상한이_한글_상한보다_뚜렷이_크다() {
+    let korean = CaptionSegmenter.recommendedCap(panelWidth: PanelFrame.defaultWidth, fontSize: 20, language: .korean)
+    let english = CaptionSegmenter.recommendedCap(panelWidth: PanelFrame.defaultWidth, fontSize: 20, language: .english)
+    #expect(english > korean * 3 / 2) // 로마자가 한글의 절반 폭이라는 문서화된 실측과 같은 방향
+}

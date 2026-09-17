@@ -114,8 +114,9 @@ import Foundation
 // 부르도록 되돌아가도 전부 통과한다. 아래 테스트들은 **전사 이벤트**를 먹이는 경로를
 // 통째로 지나므로, 어떤 입력도 목록을 비우지 못한다는 걸 실제로 고정한다.
 
-private func event(_ utteranceID: Int, _ text: String, isFinal: Bool = true) -> TranscriptEvent {
-    TranscriptEvent(utteranceID: utteranceID, sourceLanguage: .korean,
+private func event(_ utteranceID: Int, _ text: String, isFinal: Bool = true,
+                    language: CaptionLanguage = .korean) -> TranscriptEvent {
+    TranscriptEvent(utteranceID: utteranceID, sourceLanguage: language,
                     transcript: isFinal ? .final(text) : .partial(text))
 }
 
@@ -320,4 +321,22 @@ private func event(_ utteranceID: Int, _ text: String, isFinal: Bool = true) -> 
     let updates = state.apply(event(0, text, isFinal: false))
     #expect(updates.count > 1)
     #expect(updates[0].transcript.text.count <= 8)
+}
+
+// 버그 회귀(코드 리뷰): 자동 모드는 화면에 한국어·영어 줄이 섞여 있을 수 있어서
+// 상한 하나로는 부족하다 — 줄이 찍힌 발화의 언어(`TranscriptEvent.sourceLanguage`)로
+// 상한을 골라야 한다. `segmentCapsByLanguage`에 없는 언어는 `segmentCap`(위 테스트가
+// 직접 쓰는 그 필드)으로 대체된다.
+@Test @MainActor func 발화_언어별로_다른_상한이_적용된다() {
+    let text = "word word word word" // 19자 — 8보다 길고 40보다는 짧다
+    let state = CaptionState()
+    state.segmentCap = 8 // 한국어(표에 없음)는 이 값으로 대체된다.
+    state.segmentCapsByLanguage = [CaptionLanguage.english.id: 40]
+
+    let koreanUpdates = state.apply(event(0, text, isFinal: false, language: .korean))
+    let englishUpdates = state.apply(event(1, text, isFinal: false, language: .english))
+
+    #expect(koreanUpdates[0].transcript.text.count <= 8)
+    #expect(englishUpdates[0].transcript.text.count > 8)
+    #expect(englishUpdates[0].transcript.text == text) // 40자 상한 안에 전부 들어간다
 }
