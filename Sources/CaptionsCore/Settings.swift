@@ -53,6 +53,12 @@ public struct Settings: Codable, Equatable, Sendable {
     public var openAIModel: String
     /// 화면에 남겨둘 최근 발화 개수. 말이 끊이지 않는 화자에게 읽을 시간을 준다.
     public var captionHistoryCount: Int
+    /// 확정 자막을 파일로도 남길지. 화면은 최근 몇 줄만 보여주므로, 놓친 말을 나중에
+    /// 다시 읽으려면 파일이 유일한 경로다.
+    public var captionLogEnabled: Bool
+    /// 켜면 패널이 마우스를 완전히 통과시킨다 — 영상 위에 올려두고 그 아래를 조작할 수
+    /// 있다. 대신 드래그·크기조절도 막히므로 해제는 메뉴바에서 한다.
+    public var overlayLocked: Bool
     public var panelOriginX: Double?
     public var panelOriginY: Double?
     public var panelWidth: Double?
@@ -73,6 +79,8 @@ public struct Settings: Codable, Equatable, Sendable {
         refinementProvider: .claude,
         openAIModel: defaultOpenAIModel,
         captionHistoryCount: defaultCaptionHistoryCount,
+        captionLogEnabled: true,
+        overlayLocked: false,
         panelOriginX: nil,
         panelOriginY: nil,
         panelWidth: nil)
@@ -88,6 +96,8 @@ public struct Settings: Codable, Equatable, Sendable {
         refinementProvider: RefinementProvider,
         openAIModel: String,
         captionHistoryCount: Int,
+        captionLogEnabled: Bool = true,
+        overlayLocked: Bool = false,
         panelOriginX: Double?,
         panelOriginY: Double?,
         panelWidth: Double?
@@ -102,6 +112,8 @@ public struct Settings: Codable, Equatable, Sendable {
         self.refinementProvider = refinementProvider
         self.openAIModel = openAIModel
         self.captionHistoryCount = captionHistoryCount
+        self.captionLogEnabled = captionLogEnabled
+        self.overlayLocked = overlayLocked
         self.panelOriginX = panelOriginX
         self.panelOriginY = panelOriginY
         self.panelWidth = panelWidth
@@ -110,7 +122,8 @@ public struct Settings: Codable, Equatable, Sendable {
     private enum CodingKeys: String, CodingKey {
         case languageMode, preferredTargetID, audioSource, fontSize, captionHoldSeconds
         case detectorSensitivity, refinementEnabled, refinementProvider, openAIModel
-        case captionHistoryCount, panelOriginX, panelOriginY, panelWidth
+        case captionHistoryCount, captionLogEnabled, overlayLocked
+        case panelOriginX, panelOriginY, panelWidth
     }
 
     /// `captionHistoryCount`는 옛 저장값엔 없을 수 있는 non-optional 필드다 — 없으면
@@ -133,6 +146,8 @@ public struct Settings: Codable, Equatable, Sendable {
             ?? Settings.defaultCaptionHistoryCount
         let range = Settings.captionHistoryCountRange
         captionHistoryCount = min(max(storedCount, range.lowerBound), range.upperBound)
+        captionLogEnabled = try container.decodeIfPresent(Bool.self, forKey: .captionLogEnabled) ?? true
+        overlayLocked = try container.decodeIfPresent(Bool.self, forKey: .overlayLocked) ?? false
         panelOriginX = try container.decodeIfPresent(Double.self, forKey: .panelOriginX)
         panelOriginY = try container.decodeIfPresent(Double.self, forKey: .panelOriginY)
         panelWidth = try container.decodeIfPresent(Double.self, forKey: .panelWidth)

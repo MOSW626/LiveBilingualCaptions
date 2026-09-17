@@ -74,6 +74,19 @@ struct SettingsView: View {
                 Stepper(value: $settings.captionHistoryCount, in: Settings.captionHistoryCountRange) {
                     Text("표시 개수 \(settings.captionHistoryCount)줄")
                 }
+                Toggle("자막 잠금(클릭 통과)", isOn: $settings.overlayLocked)
+                Text("잠그면 자막 패널이 마우스를 통과시켜 그 아래 영상·창을 그대로 조작할 수 있습니다. 대신 패널을 옮기거나 크기를 바꿀 수 없으니, 해제는 메뉴바 '자막' 메뉴에서 하세요.")
+                    .font(.caption).foregroundStyle(.secondary)
+            }
+            Section("기록") {
+                Toggle("확정된 자막을 파일로 남기기", isOn: $settings.captionLogEnabled)
+                Text("화면은 최근 \(settings.captionHistoryCount)줄만 보여줍니다. 켜두면 밀려난 줄이 원문·번역과 함께 문서 폴더의 세션 파일에 쌓여, 놓친 말을 나중에 다시 읽을 수 있습니다. 들리는 말이 디스크에 남는다는 뜻이기도 합니다.")
+                    .font(.caption).foregroundStyle(.secondary)
+                Button("로그 폴더 열기") {
+                    let directory = CaptionLog.defaultDirectory
+                    try? FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+                    NSWorkspace.shared.open(directory)
+                }
             }
             Section("번역 보정") {
                 Toggle("LLM 으로 확정 문장 다듬기", isOn: $settings.refinementEnabled)

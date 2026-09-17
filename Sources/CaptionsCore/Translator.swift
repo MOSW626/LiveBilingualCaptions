@@ -80,10 +80,22 @@ public final class Translator {
 
     /// 실제 온디바이스 번역. 언어팩이 없으면 nil 을 돌려주고,
     /// 다운로드 프롬프트는 UI 의 .translationTask 가 맡는다.
+    ///
+    /// `.lowLatency` 를 **명시적으로** 요구한다. 기본 전략은 애플이 고르고, 고르는 기준에
+    /// 서버 왕복이 들어갈 수 있다 — 자막은 문장마다 즉시 나와야 하고 오프라인에서도
+    /// 돌아야 하므로 둘 다 받아들일 수 없다. 번역 품질은 선택적 LLM 보정이 맡는다.
+    /// (`Strategy` 는 macOS 26.4 부터다. 그 이전에서는 기본 전략으로 돌아간다.)
     public static let onDevice: TranslateFunction = { text, source, target in
         guard await packStatus(from: source, to: target) == .installed else { return nil }
-        let session = TranslationSession(
-            installedSource: source.locale.language, target: target.locale.language)
+        let session: TranslationSession
+        if #available(macOS 26.4, *) {
+            session = TranslationSession(
+                installedSource: source.locale.language, target: target.locale.language,
+                preferredStrategy: .lowLatency)
+        } else {
+            session = TranslationSession(
+                installedSource: source.locale.language, target: target.locale.language)
+        }
         return try? await session.translate(text).targetText
     }
 

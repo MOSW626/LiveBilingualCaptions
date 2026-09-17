@@ -26,6 +26,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private let settingsStore = SettingsStore()
     private let availability = LanguageAvailabilityState()
     private var statusItem: NSStatusItem?
+    private var lockMenuItem: NSMenuItem?
+    /// 화면에서 밀려난 확정 줄을 파일로 남긴다. 설정으로 끌 수 있고, 꺼져 있으면
+    /// `state.onEvict` 에서 아무 일도 하지 않으므로 파일 자체가 만들어지지 않는다.
+    private let captionLog = CaptionLog()
     private var settingsWindow: NSWindow?
     private var moveObserver: NSObjectProtocol?
     private var resizeObserver: NSObjectProtocol?
@@ -70,12 +74,24 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         buildWindow()
         buildStatusItem()
         bindController()
+        bindCaptionLog()
+        applyOverlayLock(settingsStore.value.overlayLocked)
         requestPermissionsAndStart()
     }
 
     func applicationWillTerminate(_ notification: Notification) {
         if let moveObserver { NotificationCenter.default.removeObserver(moveObserver) }
         if let resizeObserver { NotificationCenter.default.removeObserver(resizeObserver) }
+        // 아직 화면에 남아 있던 줄들 — 종료하면 퇴출 알림이 올 일이 없으므로 여기서 비운다.
+        state.clear()
+        captionLog.close()
+    }
+
+    private func bindCaptionLog() {
+        state.onEvict = { [weak self] entry, spokenAt in
+            guard let self, self.settingsStore.value.captionLogEnabled else { return }
+            self.captionLog.append(entry, spokenAt: spokenAt)
+        }
     }
 
     private func bindController() {
@@ -215,6 +231,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
         state.fontSize = new.fontSize
         state.historyCount = new.captionHistoryCount
+        if old.overlayLocked != new.overlayLocked { applyOverlayLock(new.overlayLocked) }
         state.audioSourceName = new.audioSource.displayName
         // 안전망 상한은 폭·글자 크기가 실제로 바뀔 때만 다시 잰다(§ 일반 원칙: 실시간
         // 스레드는 물론 문장마다도 재계산하지 않는다) — CTLine 실측 비용을 여기서만 쓴다.
@@ -340,11 +357,30 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         item.button?.title = "자막"
         let menu = NSMenu()
         menu.addItem(NSMenuItem(title: "설정…", action: #selector(showSettings), keyEquivalent: ","))
+        // 잠금은 영상 위에 자막을 띄워 둔 채로 즉시 켜고 끄는 값이라 메뉴바에 둔다 —
+        // 잠긴 패널은 마우스를 통과시키므로 패널 안에는 해제할 곳을 둘 수 없다.
+        let lock = NSMenuItem(title: "자막 잠금(클릭 통과)", action: #selector(toggleLock), keyEquivalent: "l")
+        menu.addItem(lock)
+        lockMenuItem = lock
         menu.addItem(.separator())
         menu.addItem(NSMenuItem(title: "종료", action: #selector(quitApp), keyEquivalent: "q"))
         menu.items.forEach { $0.target = self }
         item.menu = menu
         statusItem = item
+    }
+
+    @objc private func toggleLock() {
+        var next = settingsStore.value
+        next.overlayLocked.toggle()
+        performApply(next)
+    }
+
+    /// 잠기면 패널이 마우스를 통째로 통과시킨다 — 드래그도 리사이즈도 같이 막히므로
+    /// 해제는 메뉴바에서만 가능하다(그래서 메뉴 항목에 체크 표시를 남긴다).
+    private func applyOverlayLock(_ locked: Bool) {
+        panel?.ignoresMouseEvents = locked
+        panel?.isMovableByWindowBackground = !locked
+        lockMenuItem?.state = locked ? .on : .off
     }
 
     @objc private func showSettings() {

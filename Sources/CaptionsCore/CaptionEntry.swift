@@ -89,6 +89,16 @@ public final class CaptionState {
     /// 같은 문장을 가리킨다 — 그래서 이 인덱스를 장부 키에 그대로 써도 안전하다.
     @ObservationIgnored private var captionIDs: [(runID: Int, utteranceID: Int, segmentIndex: Int, captionID: UUID)] = []
 
+    /// 줄이 화면에서 사라질 때 딱 한 번 불린다(밀려나기 또는 비우기). 이 시점의 줄은
+    /// 더 갱신되지 않으므로 — 원문도 번역도 최종이다 — 파일로 남기기에 정확한 순간이다.
+    /// 화면에 못 올린 로그 실패가 자막을 멈추면 안 되므로 예외를 던지지 않는다.
+    @ObservationIgnored public var onEvict: ((CaptionEntry, Date) -> Void)?
+    /// 줄이 **처음 생긴** 시각. `CaptionEntry` 는 Equatable 이라 여기에 따로 둔다 —
+    /// 값에 Date 를 넣으면 같은 내용의 두 줄이 서로 달라져 버린다.
+    @ObservationIgnored private var createdAt: [UUID: Date] = [:]
+    /// 테스트가 시계를 고정할 수 있게 주입해 둔다.
+    @ObservationIgnored public var now: () -> Date = Date.init
+
     public init() {}
 
     public var isEmpty: Bool { entries.isEmpty }
@@ -159,6 +169,7 @@ public final class CaptionState {
             entries[i].isFinal = isFinal
         } else {
             entries.append(CaptionEntry(id: id, original: original, translated: "", isFinal: isFinal))
+            createdAt[id] = now()
         }
         trim()
     }
@@ -173,7 +184,9 @@ public final class CaptionState {
     /// 화면을 비운다. **침묵이 이어졌을 때와 "지우기" 버튼에서만** 부른다.
     /// 발화가 바뀌었다는 이유로는 절대 부르지 않는다.
     public func clear() {
+        let dropped = entries
         entries.removeAll()
+        evict(dropped)
         resetLedger()
     }
 
@@ -186,6 +199,18 @@ public final class CaptionState {
 
     private func trim() {
         let limit = max(1, historyCount)
-        if entries.count > limit { entries.removeFirst(entries.count - limit) }
+        guard entries.count > limit else { return }
+        let dropped = Array(entries.prefix(entries.count - limit))
+        entries.removeFirst(entries.count - limit)
+        evict(dropped)
+    }
+
+    /// 확정된 줄만 넘긴다 — 진행 중이던 줄은 잘린 문장이라 기록할 값이 없다.
+    private func evict(_ dropped: [CaptionEntry]) {
+        for entry in dropped {
+            let born = createdAt.removeValue(forKey: entry.id)
+            guard entry.isFinal, let onEvict else { continue }
+            onEvict(entry, born ?? now())
+        }
     }
 }
