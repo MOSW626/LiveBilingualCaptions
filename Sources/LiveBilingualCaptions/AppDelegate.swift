@@ -37,6 +37,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     /// 목표 폭을 구한다(델타를 계속 더하면 반올림 오차가 쌓인다). 드래그가 끝나면 nil로
     /// 돌아가 다음 드래그가 그때의 실제 폭에서 다시 시작한다.
     private var resizeStartWidth: CGFloat?
+    /// 배경 드래그 시작 시점의 마우스·패널 위치(화면 좌표). 드래그가 끝나면 nil.
+    private var moveStart: (mouse: NSPoint, origin: NSPoint)?
     private var running = false
     private var clearTask: Task<Void, Never>?
     /// 자막은 지연에 민감하다 — 가장 빠른 Haiku 계열을 쓴다. 날짜 접미사를 붙이지 않는다.
@@ -379,7 +381,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     /// 해제는 메뉴바에서만 가능하다(그래서 메뉴 항목에 체크 표시를 남긴다).
     private func applyOverlayLock(_ locked: Bool) {
         panel?.ignoresMouseEvents = locked
-        panel?.isMovableByWindowBackground = !locked
         lockMenuItem?.state = locked ? .on : .off
     }
 
@@ -423,7 +424,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         panel.hidesOnDeactivate = false
         panel.isReleasedWhenClosed = false
         panel.becomesKeyOnlyIfNeeded = true
-        panel.isMovableByWindowBackground = true
+        // 이동은 SwiftUI 배경 드래그가 직접 한다(`movePanel`). 이걸 켜 두면 AppKit 이동이
+        // 살아나는 OS 에서 두 경로가 겹쳐 창이 두 배로 움직인다.
+        panel.isMovableByWindowBackground = false
         panel.backgroundColor = .clear
         panel.isOpaque = false
         panel.hasShadow = true
@@ -439,7 +442,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             onQuit: { [weak self] in self?.quitApp() },
             onHeight: { [weak self] height in self?.fitPanel(toContentHeight: height) },
             onResizeChanged: { [weak self] translationX in self?.resizePanel(translationX: translationX) },
-            onResizeEnded: { [weak self] in self?.resizeStartWidth = nil })
+            onResizeEnded: { [weak self] in self?.resizeStartWidth = nil },
+            onMoveChanged: { [weak self] in self?.movePanel() },
+            onMoveEnded: { [weak self] in self?.moveStart = nil })
         let hosting = NSHostingView(rootView: overlay)
         hosting.frame = NSRect(origin: .zero, size: frame.size)
         panel.contentView = hosting
@@ -503,6 +508,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     /// `persistPanelGeometry()` → `apply(_:)`로 흘려보낸다 — 창 이동(배경 드래그)이
     /// 저장되는 경로와 완전히 같다. 그래서 폭 변경도 다른 설정과 똑같이 **하나뿐인**
     /// 적용 경로를 탄다.
+    /// 배경 드래그로 창을 옮긴다. 시작 시점의 마우스·창 위치를 잡아 두고 화면 좌표 차이만큼
+    /// 옮긴다 — 저장은 기존 이동 관찰자(`observePanelGeometry`)가 한다.
+    private func movePanel() {
+        guard let panel else { return }
+        let mouse = NSEvent.mouseLocation
+        let start = moveStart ?? (mouse, panel.frame.origin)
+        moveStart = start
+        panel.setFrameOrigin(NSPoint(x: start.origin.x + mouse.x - start.mouse.x,
+                                     y: start.origin.y + mouse.y - start.mouse.y))
+    }
+
     private func resizePanel(translationX: CGFloat) {
         guard let panel else { return }
         let base = resizeStartWidth ?? panel.frame.width

@@ -18,6 +18,10 @@ struct CaptionOverlay: View {
     /// 드래그가 끝났다. 다음 드래그가 그 시점의 실제 폭에서 다시 시작하도록 호출자가
     /// 기준값을 지우는 신호다.
     var onResizeEnded: () -> Void
+    /// 배경 드래그 중/끝. 창 이동은 호출자가 화면 좌표(`NSEvent.mouseLocation`)로 직접 한다 —
+    /// 제스처의 translation 은 창 좌표라 창이 움직이면 기준이 같이 흔들린다.
+    var onMoveChanged: () -> Void
+    var onMoveEnded: () -> Void
 
     /// 언어팩이 없으면 이 설정이 non-nil 이 되고, .translationTask 가 다운로드 시트를 띄운다.
     /// SwiftUI 로 그리는 이유가 이 한 줄이다.
@@ -72,6 +76,15 @@ struct CaptionOverlay: View {
         // 것이므로 밝기를 환경에 맡기지 않고 어둡게 고정한다.
         .background(.black.opacity(0.5), in: .rect(cornerRadius: 20))
         .background(.ultraThinMaterial, in: .rect(cornerRadius: 20))
+        // 창 이동. 예전엔 `isMovableByWindowBackground` 에 맡겼는데 2026-10-27(macOS 27,
+        // CLT 27 빌드)부터 SwiftUI 배경 클릭이 창을 끌지 않는다. 버튼·리사이즈 손잡이는
+        // 자기 제스처가 먼저 가져간다.
+        .contentShape(.rect(cornerRadius: 20))
+        .gesture(
+            DragGesture(minimumDistance: 1)
+                .onChanged { _ in onMoveChanged() }
+                .onEnded { _ in onMoveEnded() }
+        )
         // 부수효과: 아래 .bordered 버튼들도 어두운 테마(밝은 글자)로 바뀐다. 의도한 것이다 —
         // 어두운 HUD 위의 버튼이라 그게 맞다. "밝은 테마로 되돌리는" 수정을 하지 말 것.
         .environment(\.colorScheme, .dark)
