@@ -1,6 +1,8 @@
 # LiveBilingualCaptions
 
-macOS 26 전용 실시간 양국어 자막 오버레이. 본인 맥 전용(배포 안 함).
+macOS 26 전용 실시간 양국어 자막 오버레이. 앱 바이너리 배포는 안 한다(서명·공증 없음).
+소스는 공개: https://github.com/MOSW626/LiveBilingualCaptions (MIT). 커밋은 `main` 에
+쌓고, 기능·수정이 끝나면 push 해서 공개본을 최신으로 유지한다.
 
 ## 명령
 - **설치: `./install.sh`** → `/Applications` 에 갈아끼운다. 그 뒤로는 Launchpad·Spotlight·

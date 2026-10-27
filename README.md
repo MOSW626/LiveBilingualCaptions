@@ -4,6 +4,36 @@
 자막은 발화 하나가 아니라 **최근 발화 목록**입니다 — 말이 끊이지 않아도 이전 문장이
 곧바로 사라지지 않고 화면에 남아 읽을 시간을 줍니다.
 
+- 음성 인식(`SpeechAnalyzer`)과 번역(Apple `Translation`)을 **전부 기기 안에서** 처리합니다. 비용 0원.
+- 마이크 또는 시스템 오디오(회의·영상)를 듣고, 한·영을 자동으로 판별합니다.
+- 서드파티 의존성이 없습니다.
+
+## 빠른 시작
+
+**요구 사항:** macOS 26 이상, Swift 6.2 이상(Command Line Tools 로 충분, 전체 Xcode 불필요).
+
+```bash
+git clone https://github.com/MOSW626/LiveBilingualCaptions.git
+cd LiveBilingualCaptions
+./install.sh   # /Applications 에 설치 → Launchpad·Spotlight 에서 실행
+./test.sh      # 테스트 (맨 `swift test` 는 swift-testing 경로 문제로 실패합니다)
+```
+
+권한(마이크·화면 기록)을 빌드마다 다시 묻지 않게 하려면 [CLAUDE.md](CLAUDE.md)의
+"코드서명 인증서 만들기"를 한 번 따라 하세요.
+
+## 어떻게 만들었나
+
+Claude Code 와 이틀(2026-09-16~17) 동안 만들었습니다.
+
+1. 504줄짜리 단일 파일 시제품에서 출발
+2. 브레인스토밍 → 설계서·작업 계획서 먼저 작성 ([docs/superpowers](docs/superpowers))
+3. 계획이 기대는 macOS 26 API 가 SDK 에 실제로 있는지 확인한 뒤 코딩
+4. 작업 단위로 쪼개 테스트 먼저(TDD) 구현
+5. 직접 써 보며 불편한 점을 바로 고치는 반복
+
+구조·데이터 흐름 다이어그램은 [docs/diagrams](docs/diagrams)에 있습니다.
+
 ## 개발 및 실행
 
 터미널에서 다음 명령을 실행하면 앱을 빌드하고 바로 시작합니다.
@@ -47,7 +77,7 @@
   글자 크기, 표시 개수, 자막 유지 시간 등을 바꿀 수 있습니다.
 
 음성 인식과 번역은 모두 macOS 내장 기능으로 **기기 안에서** 처리됩니다.
-설정에서 "Claude 로 확정 문장 다듬기"를 켠 경우에만, 확정된 문장이 Anthropic API로 전송됩니다.
+설정에서 "LLM 으로 확정 문장 다듬기"를 켠 경우에만, 확정된 문장이 고른 제공자(Anthropic 또는 OpenAI) API로 전송됩니다.
 이 기능은 기본적으로 꺼져 있습니다.
 
 ## 라이선스
