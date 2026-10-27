@@ -946,6 +946,21 @@ let autoConfig = PipelineConfiguration(source: .microphone, language: .korean, s
     #expect(b.id == c.id) // 누적이 아니라 "직전 조각 대비" 허용치로 비교해야 한다
 }
 
+// 실측(2026-10-27 LBC_TIMING): volatile 은 직전 final 끝(15.36초)부터 잡히는데, 같은 말의
+// final 은 무음을 걷어낸 실제 발화 시작(18.36초)으로 온다. 시작 시각만 비교하면 3초 차라
+// final 이 새 발화가 되고, partial 줄(완결 문장은 이미 로그에 남는다)과 final 줄이 같은
+// 문장으로 두 번 찍혔다(자막 로그의 중복 줄 ~5-10%).
+@Test func final이_진행_중_partial_구간_안에서_시작하면_같은_발화다() {
+    var ledger = UtteranceLedger()
+    let a = ledger.assign(start: 15.36, end: 19.29, isFinal: false)
+    let b = ledger.assign(start: 15.36, end: 22.19, isFinal: false)
+    let final = ledger.assign(start: 18.36, end: 24.12, isFinal: true)
+    let next = ledger.assign(start: 24.12, end: 29.88, isFinal: false)
+    #expect(a.id == b.id)
+    #expect(final.id == b.id)
+    #expect(next.id != final.id, "확정 뒤 이어지는 구간은 새 발화다")
+}
+
 @Test @MainActor func 전사_이벤트는_실행ID_발화ID_언어를_함께_싣는다() async {
     let harness = Harness()
     harness.controller.requestStart(configuration: koreanConfig)

@@ -132,7 +132,11 @@ public struct UtteranceLedger: Sendable {
     public init(tolerance: Double = 0.2) { self.tolerance = tolerance }
 
     public mutating func assign(start: Double, end: Double, isFinal: Bool) -> Assignment {
-        if let index = entries.lastIndex(where: { !$0.finalized && abs($0.start - start) <= tolerance }) {
+        // 시작 시각만이 아니라 진행 중 구간 안에서 시작하는지를 본다 — final 은 무음을 걷어낸
+        // 실제 발화 시작으로 와서 volatile 시작보다 몇 초 늦을 수 있다(2026-10-27 실측 3초).
+        if let index = entries.lastIndex(where: {
+            !$0.finalized && start >= $0.start - tolerance && start <= $0.end + tolerance
+        }) {
             entries[index].revision += 1
             entries[index].start = start // 직전 대비로만 흔들림을 잰다 — 흔들림이 쌓이지 않게.
             entries[index].end = max(entries[index].end, end)
