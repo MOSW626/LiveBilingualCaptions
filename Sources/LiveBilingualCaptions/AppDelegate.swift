@@ -643,5 +643,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
-    func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool { true }
+    /// 자막 패널은 `NSPanel`이라 AppKit의 "마지막 창" 집계에서 빠진다 — true 면 설정 창을
+    /// 닫는 순간 그게 마지막 창으로 잡혀 앱이 통째로 종료된다(창 하나짜리 앱이던 시절의
+    /// 잔재). 종료는 메뉴바 '종료'와 패널의 종료 버튼으로만 한다.
+    func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool { false }
 }
