@@ -477,3 +477,22 @@ private struct Emission: Equatable {
     // 방출 "순서"는 게이트를 한꺼번에 풀 때 보장되지 않는다 — 고정할 값은 집합이다.
     #expect(Set(received.map(\.captionID)) == Set(ids.dropFirst()))
 }
+
+/// 실측(2026-09~10 자막 로그): 한→영 줄의 "번역"이 원문 한국어와 똑같이 찍혔다.
+/// Apple 번역은 그 문장들을 정상 번역하므로, 보정기가 원문 언어로 되돌려 쓴 것이다.
+private actor SourceLanguageEchoRefiner: TranslationRefiner {
+    func refine(_ draft: String, source: String, context: [String]) async throws -> String {
+        source
+    }
+}
+
+@Test @MainActor func 회귀_보정기가_원문_언어로_답하면_기계_번역을_유지한다() async {
+    let translator = Translator(table: .default, translate: { _, _, _ in "And now I don't remember." })
+    translator.refiner = SourceLanguageEchoRefiner()
+    var received: [(String, Bool)] = []
+    translator.onTranslation = { text, refined, _ in received.append((text, refined)) }
+
+    await translator.handle(.final("그리고 이젠 기억이 안 나요."), from: .korean)
+    #expect(received.count == 1, "원문 언어로 돌아온 보정은 화면에 반영하면 안 된다")
+    #expect(received.first?.0 == "And now I don't remember.")
+}

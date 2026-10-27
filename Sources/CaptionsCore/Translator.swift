@@ -1,4 +1,5 @@
 import Foundation
+import NaturalLanguage
 import Synchronization
 import Translation
 
@@ -225,12 +226,23 @@ public final class Translator {
         guard let improved = try? await refiner.refine(
             draft, source: text, context: context),
               isCurrent(ticket, for: captionID), !improved.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
-              improved != draft
+              improved != draft,
+              Self.reads(draft, as: source) || !Self.reads(improved, as: source)
         else { return }
         // 채택된 번역으로 갱신해둬야 다음 문장의 문맥이 다듬어진 쪽을 본다.
         if let i = contextHistory.firstIndex(where: { $0.captionID == captionID }) {
             contextHistory[i].translated = improved
         }
         onTranslation?(improved, true, captionID)
+    }
+
+    /// `emit` 은 이걸로 "기계 번역은 원문과 다른 언어였는데 보정이 원문 언어로 되돌렸다"를
+    /// 걸러낸다. 실측(2026-09~10 자막 로그): 한→영 줄의
+    /// "번역"이 한국어 원문 그대로 찍혔다 — Apple 번역은 정상인데 LLM 이 되돌려 쓴 것이다.
+    /// ponytail: 짧은 혼용문(한국어+영어 용어)은 영어로 판정될 수 있다 — 그땐 보정을 버리고
+    /// 기계 번역을 남길 뿐이라 화면이 틀리지는 않는다.
+    static func reads(_ text: String, as language: CaptionLanguage) -> Bool {
+        guard let code = language.locale.language.languageCode?.identifier else { return false }
+        return NLLanguageRecognizer.dominantLanguage(for: text)?.rawValue == code
     }
 }
